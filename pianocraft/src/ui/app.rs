@@ -109,6 +109,7 @@ pub struct App {
     prev_pressed: HashSet<u8>,
     peek: bool,
     metro_only: bool,
+    lib_filter: u8,
     update: Option<crate::updater::Release>,
     update_rx: Option<Receiver<(bool, Result<Option<crate::updater::Release>, String>)>>,
     install_rx: Option<Receiver<Result<PathBuf, String>>>,
@@ -141,7 +142,9 @@ impl App {
         cc.egui_ctx.set_style(style);
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
 
+        crate::startlog::log("starting audio");
         let audio = Audio::start();
+        crate::startlog::log(&format!("audio ready: {}", audio.device_name));
         let mut progress = Progress::load();
         if progress.scan_folder.is_empty() {
             progress.scan_folder = dirs::document_dir().map(|d| d.display().to_string()).unwrap_or_default();
@@ -155,6 +158,7 @@ impl App {
             }
             progress.save();
         }
+        crate::startlog::log("loading progress / midi");
         let mut midi = MidiIn::default();
         let midi_ports = MidiIn::list_ports();
         if let Some(port) = progress.midi_port.clone() {
@@ -169,7 +173,7 @@ impl App {
             midi,
             midi_ports,
             progress,
-            builtins: builtin::all(),
+            builtins: { let mut v = builtin::all(); v.extend(crate::repertoire::pieces()); v },
             tab: Tab::Today,
             cur: None,
             book_only: None,
@@ -204,6 +208,7 @@ impl App {
             prev_pressed: HashSet::new(),
             peek: false,
             metro_only: false,
+            lib_filter: 0,
             update: None,
             update_rx: None,
             install_rx: None,
@@ -212,6 +217,7 @@ impl App {
         if app.progress.auto_update && curriculum::now_secs().saturating_sub(app.progress.last_update_check) > 6 * 3600 {
             app.check_updates(false);
         }
+        crate::startlog::log("window ready");
         app.dev_hooks();
         app.audio.send(Cmd::Volume(app.volume));
         app.audio.send(Cmd::CountIn(app.count_in));
@@ -235,6 +241,17 @@ impl App {
             self.tech = TechSpec { ex: Exercise::Scale, scale: ScaleType::Dorian, tonic: 2, octaves: 2, pattern: Pattern::Circling, motion: Motion::Parallel, rhythm: Rhythm::Eighths, cycle: Cycle::WholeTones, ..TechSpec::default() };
             let p = generate(&self.tech);
             self.open_piece(p, true, None);
+        }
+        if let Ok(l) = std::env::var("PIANOCRAFT_LEVEL").map(|s| s.parse::<usize>().unwrap_or(7)) {
+            if let Some(c) = self.cur.as_mut() {
+                let (_, r, lh) = crate::transform::LEVELS[(l.max(1) - 1).min(6)];
+                c.arr.rh = r;
+                c.arr.lh = lh;
+            }
+            self.reload();
+        }
+        if let Ok(f) = std::env::var("PIANOCRAFT_LIBFILTER").map(|s| s.parse::<u8>().unwrap_or(0)) {
+            self.lib_filter = f;
         }
         if std::env::var("PIANOCRAFT_PLAY").is_ok() {
             self.audio.send(Cmd::Play);
@@ -675,8 +692,13 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.audio.send(Cmd::Pause);
         self.progress.save();
         self.bookview.notes.save();
+        crate::startlog::log("closed cleanly");
+        // Leave immediately: shutting down audio/MIDI drivers can hang on some PCs, which would
+        // keep an invisible PianoCraft running and stop the next launch.
+        std::process::exit(0);
     }
 }
 
@@ -943,6 +965,27 @@ impl App {
                     }
                 }
             }
+            // repertoire at this unit's level
+            let grade: u8 = match self.unit_sel { 0..=3 => 1, 4..=7 => 2, _ => 3 };
+            let rep: Vec<Piece> = self.builtins.iter().filter(|p| crate::repertoire::grade_of(&p.id) == Some(grade) && !self.progress.done(&p.id)).take(3).cloned().collect();
+            card(ui, |ui| {
+                ui.label(RichText::new(format!("Repertoire at your level – Grade {grade}")).weak());
+                for p in &rep {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&p.title).size(15.0));
+                        ui.label(RichText::new(&p.composer).small().weak());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Start ▶").clicked() {
+                                open_piece = Some((p.clone(), false));
+                            }
+                        });
+                    });
+                }
+                if ui.small_button("See all 55 graded pieces in the Library").clicked() {
+                    self.lib_filter = 1;
+                    self.tab = Tab::Library;
+                }
+            });
             // your own music near your level
             let mut lib: Vec<(f32, Piece)> = self.progress.library.iter().filter(|p| !p.id.starts_with("omr-")).map(|p| (rate(p).score, p.clone())).filter(|(_, p)| !self.progress.done(&p.id)).collect();
             lib.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -1324,6 +1367,19 @@ impl App {
         });
 
         ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Difficulty").strong());
+            let cur_level = crate::transform::level_of(&c.arr);
+            let mut lvl = cur_level.map(|l| l as u32 + 1).unwrap_or(7);
+            let resp = ui.add(egui::Slider::new(&mut lvl, 1..=7).show_value(false)).on_hover_text("Like a rhythm game: 1 = just the tune, 7 = every note. Each step brings more notes back.");
+            ui.label(RichText::new(match cur_level { Some(l) => crate::transform::LEVELS[l].0, None => "custom (set below)" }).color(accent()));
+            if resp.changed() {
+                let (_, r, l) = crate::transform::LEVELS[(lvl as usize - 1).min(6)];
+                c.arr.rh = r;
+                c.arr.lh = l;
+                changed = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Right hand").color(RH_COLOR));
             egui::ComboBox::from_id_salt("rh").selected_text(c.arr.rh.label()).show_ui(ui, |ui| {
                 for m in RhMode::ALL {
@@ -1584,13 +1640,32 @@ impl App {
             }
         });
         ui.separator();
-        let mut rows: Vec<(Piece, f32)> = self.builtins.iter().chain(self.progress.library.iter()).map(|p| (p.clone(), rate(p).score)).collect();
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        ui.horizontal(|ui| {
+            ui.label("Show:");
+            for (i, name) in ["Everything", "Repertoire (graded)", "Course pieces", "Your imports"].iter().enumerate() {
+                ui.selectable_value(&mut self.lib_filter, i as u8, *name);
+            }
+        });
+        let filter = self.lib_filter;
+        // sort key: repertoire by grade, everything else by computed difficulty mapped onto the same 1–8 scale
+        let mut rows: Vec<(Piece, f32)> = self
+            .builtins
+            .iter()
+            .chain(self.progress.library.iter())
+            .filter(|p| match filter {
+                1 => p.id.starts_with("rep-"),
+                2 => matches!(p.origin, Origin::BuiltIn) && !p.id.starts_with("rep-"),
+                3 => matches!(p.origin, Origin::Imported(_)),
+                _ => true,
+            })
+            .map(|p| (p.clone(), crate::repertoire::grade_of(&p.id).map(|g| g as f32).unwrap_or_else(|| rate(p).score * 0.8)))
+            .collect();
+        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.title.cmp(&b.0.title)));
         let mut open = None;
         let mut remove = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("lib").striped(true).num_columns(6).spacing(Vec2::new(16.0, 8.0)).show(ui, |ui| {
-                ui.strong("Difficulty");
+                ui.strong("Level");
                 ui.strong("Title");
                 ui.strong("Key");
                 ui.strong("Source");
@@ -1598,8 +1673,12 @@ impl App {
                 ui.strong("");
                 ui.end_row();
                 for (p, d) in &rows {
-                    let col = if *d < 4.0 { green() } else if *d < 6.5 { Color32::from_rgb(240, 200, 80) } else { Color32::from_rgb(240, 110, 90) };
-                    ui.label(RichText::new(format!("{:.1}", d)).color(col).strong());
+                    let col = if *d < 3.0 { green() } else if *d < 5.5 { Color32::from_rgb(240, 200, 80) } else { Color32::from_rgb(240, 110, 90) };
+                    let lvl = match crate::repertoire::grade_of(&p.id) {
+                        Some(g) => format!("Grade {g}"),
+                        None => format!("≈ {:.0}", d.max(1.0)),
+                    };
+                    ui.label(RichText::new(lvl).color(col).strong()).on_hover_text("Grades are approximate (ABRSM-style, 1–8). '≈' = estimated from the notes.");
                     ui.vertical(|ui| {
                         ui.set_min_width(360.0);
                         ui.label(RichText::new(&p.title).strong());
@@ -1609,6 +1688,7 @@ impl App {
                     });
                     ui.label(p.key_name());
                     ui.label(match &p.origin {
+                        Origin::BuiltIn if p.id.starts_with("rep-") => "repertoire".to_string(),
                         Origin::BuiltIn => "built-in".to_string(),
                         Origin::Generated => "generated".into(),
                         Origin::Imported(_) if p.id.starts_with("omr-") => "from your book".into(),

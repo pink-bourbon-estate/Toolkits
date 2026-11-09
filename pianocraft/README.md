@@ -31,6 +31,8 @@ The only network requests are anonymous downloads from github.com. No account, n
   - Seven rhythms, accents, crescendo-diminuendo, and key chains (fifths, fourths, whole tones, minor thirds, chromatic).
   - Fingering is automatic and matches the standard tables.
 - **Note reading**: Nahre Sol's landmark method in four levels. Answer on screen or on your piano.
+- **Difficulty slider** (Practice, like a rhythm game): 1 = just the tune on the main beats, 2 = the whole tune, 3 = + held bass notes, 4 = + bass line, 5 = tune with one harmony note, 6 = full right hand, 7 = everything. Works on every piece, including your imports.
+- **Repertoire**: 55 graded pieces built in (Grade 1–8, Mutopia Project, public domain / CC BY-SA). Includes all the Anna Magdalena minuets and polonaises, Schumann *Album for the Young*, Tchaikovsky *Children's Album*, Burgmüller Op. 100, Czerny, Handel, Clementi, Für Elise, Bach's C major Prelude and Inventions, Satie, Joplin, Chopin preludes and waltz, *Träumerei*, *Moonlight* (I), Debussy's Arabesque No. 1 and Clair de lune. Credits are in `repertoire/LICENSES.md`.
 - **Library / Find music**: import MIDI and MusicXML, and search free sources.
 
 ## Making book pages playable (Audiveris)
@@ -52,6 +54,9 @@ Keyboards with a USB port just need a USB cable. Many digital pianos have round 
 3. In Settings, click **Look for keyboards → Connect**.
 
 Once connected, the keys you press light up green, and **Wait for me** pauses at each note until you play it.
+
+## Troubleshooting
+If PianoCraft ever doesn't open, look at `%APPDATA%\\PianoCraft\\startup.log`: the last line shows how far it got. It only records step names and times, and never leaves your PC.
 
 ## Your data
 Progress, annotations and imported songs live in `%APPDATA%\PianoCraft\`.

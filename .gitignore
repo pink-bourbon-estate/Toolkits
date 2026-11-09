@@ -19,3 +19,6 @@ annotations.json
 *.pfx
 *.p12
 id_rsa*
+
+# …except the built-in, freely licensed repertoire
+!pianocraft/repertoire/*.mid

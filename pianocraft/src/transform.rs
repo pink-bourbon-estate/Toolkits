@@ -9,6 +9,8 @@ pub enum RhMode {
     Full,
     /// Only the top note of each chord (the tune).
     Melody,
+    /// The tune plus the next note down in each chord.
+    MelodyPlus,
     /// Only the tune's notes that fall on main beats, held longer.
     Skeleton,
     Off,
@@ -38,11 +40,12 @@ impl Default for Arrangement {
 }
 
 impl RhMode {
-    pub const ALL: [RhMode; 4] = [RhMode::Full, RhMode::Melody, RhMode::Skeleton, RhMode::Off];
+    pub const ALL: [RhMode; 5] = [RhMode::Full, RhMode::MelodyPlus, RhMode::Melody, RhMode::Skeleton, RhMode::Off];
     pub fn label(self) -> &'static str {
         match self {
             RhMode::Full => "As written",
             RhMode::Melody => "Tune only (no chords)",
+            RhMode::MelodyPlus => "Tune + one harmony note",
             RhMode::Skeleton => "Main beats only",
             RhMode::Off => "Off",
         }
@@ -142,6 +145,13 @@ pub fn arrange(piece: &Piece, a: &Arrangement) -> Piece {
     match a.rh {
         RhMode::Full => notes.extend(rh.iter().map(|n| (*n).clone())),
         RhMode::Melody => notes.extend(top_line(&rh)),
+        RhMode::MelodyPlus => {
+            for g in group_by_onset(&rh) {
+                let mut g = g;
+                g.sort_by(|a, b| b.pitch.cmp(&a.pitch));
+                notes.extend(g.into_iter().take(2));
+            }
+        }
         RhMode::Skeleton => notes.extend(skeleton(top_line(&rh), piece, main_beat(piece))),
         RhMode::Off => {}
     }
@@ -230,9 +240,9 @@ pub fn rate(piece: &Piece) -> Difficulty {
         }
     }
     let together = piece.has_hand(Hand::Right) && piece.has_hand(Hand::Left);
-    let mut score = 1.0 + nps * 1.1 + (max_chord as f32 - 1.0) * 0.7 + black * 4.0 + (span as f32 - 7.0).max(0.0) * 0.18;
+    let mut score = 1.0 + nps * 0.5 + (max_chord as f32 - 1.0) * 0.45 + black * 2.5 + (span as f32 - 7.0).max(0.0) * 0.1;
     if together {
-        score += 1.0;
+        score += 0.6;
     }
     Difficulty {
         score: score.clamp(1.0, 10.0),
@@ -242,4 +252,19 @@ pub fn rate(piece: &Piece) -> Difficulty {
         hand_span: span,
         hands_together: together,
     }
+}
+
+/// One "difficulty" slider, like a rhythm game: each level brings back more of the notes.
+pub const LEVELS: [(&str, RhMode, LhMode); 7] = [
+    ("1 · Tune, main beats only", RhMode::Skeleton, LhMode::Off),
+    ("2 · Tune only", RhMode::Melody, LhMode::Off),
+    ("3 · Tune + held bass notes", RhMode::Melody, LhMode::Roots),
+    ("4 · Tune + bass line", RhMode::Melody, LhMode::Bass),
+    ("5 · Tune with harmony + bass line", RhMode::MelodyPlus, LhMode::Bass),
+    ("6 · Full right hand + bass line", RhMode::Full, LhMode::Bass),
+    ("7 · Full score", RhMode::Full, LhMode::Full),
+];
+
+pub fn level_of(a: &Arrangement) -> Option<usize> {
+    LEVELS.iter().position(|(_, r, l)| *r == a.rh && *l == a.lh)
 }
