@@ -84,3 +84,4 @@ The engine is kept below the UI, the same layering as EffectCraft.
 License: MIT OR Apache-2.0.
 
 The ♯/♭/♮ symbols use a 4 KB subset of the DejaVu Sans font (free licence, see `assets/DEJAVU-LICENSE.txt`).
+
