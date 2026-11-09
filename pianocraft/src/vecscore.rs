@@ -1,0 +1,973 @@
+//! Built-in reader for *digitally typeset* sheet-music PDFs (MuseScore, Sibelius, Finale,
+//! Dorico, LilyPond-with-SMuFL…). These PDFs don't contain pictures of notes: every notehead,
+//! clef, accidental and rest is a character from a music font, drawn at an exact position, and
+//! staff lines, stems, barlines and beams are exact vector lines. So instead of guessing from
+//! pixels (optical recognition), we read the symbols directly.
+//!
+//! Two music-font layouts are understood:
+//! * SMuFL (MuseScore 3/4 "MScore"/"Leland"/"Bravura", Dorico, Finale 27+): Unicode code points U+E000…
+//! * Sonata layout (Sibelius "Opus", Finale "Maestro", "Petrucci", "Engraver"): classic 8-bit codes,
+//!   which show up either as Mac-Roman characters or as U+F0xx.
+//!
+//! Scanned books (pictures of pages) can't be read this way – see `pdfview.rs` (Audiveris).
+
+use crate::model::{Hand, Note, Origin, Piece};
+use hayro::hayro_interpret::font::GlyphRun;
+use hayro::hayro_interpret::kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
+use hayro::hayro_interpret::{
+    interpret_page, BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask,
+};
+use hayro::hayro_syntax::Pdf;
+use hayro::hayro_interpret::TransformExt;
+
+/// hayro glyph units → em (calibrated: noteheads are drawn at 4 staff-spaces per em).
+const GLYPH_SCALE: f64 = 1.0;
+
+// ------------------------------------------------------------------ symbols
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sym {
+    HeadBlack,
+    HeadHalf,
+    HeadWhole,
+    ClefG,
+    ClefF,
+    ClefC,
+    Sharp,
+    Flat,
+    Natural,
+    DoubleSharp,
+    DoubleFlat,
+    Dot,
+    RestWhole,
+    RestHalf,
+    RestQuarter,
+    Rest8,
+    Rest16,
+    Rest32,
+    Flag(u8),
+    TimeDigit(u8),
+    CommonTime,
+    CutTime,
+    TupletDigit(u8),
+    Eight, // small "8" under a clef (guitar treble clef)
+}
+
+/// SMuFL code point → symbol.
+fn smufl(c: u32) -> Option<Sym> {
+    Some(match c {
+        0xE0A2 | 0xE0A0 => Sym::HeadWhole,
+        0xE0A3 => Sym::HeadHalf,
+        0xE0A4 => Sym::HeadBlack,
+        0xE050 | 0xE07A => Sym::ClefG,
+        0xE052 => Sym::ClefG, // gClef8vb handled via flag below
+        0xE062 | 0xE07C => Sym::ClefF,
+        0xE05C | 0xE07B => Sym::ClefC,
+        0xE260 => Sym::Flat,
+        0xE261 => Sym::Natural,
+        0xE262 => Sym::Sharp,
+        0xE263 => Sym::DoubleSharp,
+        0xE264 => Sym::DoubleFlat,
+        0xE1E7 => Sym::Dot,
+        0xE4E3 => Sym::RestWhole,
+        0xE4E4 => Sym::RestHalf,
+        0xE4E5 => Sym::RestQuarter,
+        0xE4E6 => Sym::Rest8,
+        0xE4E7 => Sym::Rest16,
+        0xE4E8 => Sym::Rest32,
+        0xE240 | 0xE241 => Sym::Flag(1),
+        0xE242 | 0xE243 => Sym::Flag(2),
+        0xE244 | 0xE245 => Sym::Flag(3),
+        0xE080..=0xE089 => Sym::TimeDigit((c - 0xE080) as u8),
+        0xE08A => Sym::CommonTime,
+        0xE08B => Sym::CutTime,
+        0xE880..=0xE889 => Sym::TupletDigit((c - 0xE880) as u8),
+        _ => return None,
+    })
+}
+
+/// Unicode character → Mac-Roman byte, for the characters the Sonata layout uses.
+fn mac_roman(c: char) -> Option<u8> {
+    let u = c as u32;
+    if u < 0x80 {
+        return Some(u as u8);
+    }
+    if (0xF020..=0xF0FF).contains(&u) {
+        return Some((u - 0xF000) as u8);
+    }
+    Some(match c {
+        'œ' => 0xCF,
+        'Œ' => 0xCE,
+        '˙' => 0xFA,
+        '‰' => 0xE4,
+        '≈' => 0xC5,
+        'Ó' => 0xEE,
+        '∑' => 0xB7,
+        '™' => 0xAA,
+        'Â' => 0xE5,
+        '∫' => 0xBA,
+        '∂' => 0xB6,
+        '¨' => 0xAC,
+        'Ú' => 0xF2,
+        'Ô' => 0xEF,
+        '·' => 0xE1,
+        'Î' => 0xEB,
+        '¥' => 0xB4,
+        _ => return None,
+    })
+}
+
+/// Sonata-layout byte → symbol.
+fn sonata(b: u8) -> Option<Sym> {
+    Some(match b {
+        0xCF => Sym::HeadBlack,
+        0xFA => Sym::HeadHalf,
+        b'w' => Sym::HeadWhole,
+        b'&' => Sym::ClefG,
+        b'?' => Sym::ClefF,
+        b'B' => Sym::ClefC,
+        b'#' => Sym::Sharp,
+        b'b' => Sym::Flat,
+        b'n' => Sym::Natural,
+        0xDC => Sym::DoubleSharp,
+        0xBA => Sym::DoubleFlat,
+        b'.' | b'k' | 0xAA => Sym::Dot,
+        0xB7 | 0xE3 => Sym::RestWhole,
+        0xEE => Sym::RestHalf,
+        0xCE => Sym::RestQuarter,
+        0xE4 => Sym::Rest8,
+        0xC5 => Sym::Rest16,
+        0xA8 => Sym::Rest32,
+        b'j' | b'J' => Sym::Flag(1),
+        b'r' | b'R' => Sym::Flag(2),
+        0xEF | 0xC6 => Sym::Flag(3),
+        b'0'..=b'9' => Sym::TimeDigit(b - b'0'),
+        b'c' => Sym::CommonTime,
+        b'C' => Sym::CutTime,
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct Glyph {
+    pub sym: Option<Sym>,
+    pub ch: char,
+    pub x: f64,
+    pub y: f64,
+    /// Font size in page units (music fonts are drawn at 4 staff-spaces per em).
+    pub size: f64,
+    pub smufl: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Seg {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+    pub w: f64,
+}
+
+#[derive(Default)]
+pub struct PageMarks {
+    pub glyphs: Vec<Glyph>,
+    pub segs: Vec<Seg>,
+    /// Filled shapes (beams, slurs, …): bounding box and outline points.
+    pub fills: Vec<(Rect, Vec<Point>)>,
+    pub width: f64,
+    pub height: f64,
+}
+
+struct Collector<'m> {
+    m: &'m mut PageMarks,
+}
+
+fn flatten(path: &BezPath, t: Affine) -> Vec<Vec<Point>> {
+    let mut out = vec![];
+    let mut cur: Vec<Point> = vec![];
+    for el in path.elements() {
+        match el {
+            PathEl::MoveTo(p) => {
+                if cur.len() > 1 {
+                    out.push(std::mem::take(&mut cur));
+                }
+                cur = vec![t * *p];
+            }
+            PathEl::LineTo(p) => cur.push(t * *p),
+            PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => cur.push(t * *p),
+            PathEl::ClosePath => {
+                if let Some(f) = cur.first().copied() {
+                    cur.push(f);
+                }
+            }
+        }
+    }
+    if cur.len() > 1 {
+        out.push(cur);
+    }
+    out
+}
+
+impl<'a> Device<'a> for Collector<'_> {
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        let t = props.transform;
+        let scale = t.determinant().abs().sqrt();
+        let stroke = match draw_mode {
+            DrawMode::Stroke(s) | DrawMode::FillAndStroke(_, s) => Some(s.line_width as f64 * scale),
+            _ => None,
+        };
+        for poly in flatten(path, t) {
+            let bb = poly.iter().fold(Rect::new(f64::MAX, f64::MAX, f64::MIN, f64::MIN), |r, p| Rect::new(r.x0.min(p.x), r.y0.min(p.y), r.x1.max(p.x), r.y1.max(p.y)));
+            match stroke {
+                Some(w) => {
+                    for pair in poly.windows(2) {
+                        self.m.segs.push(Seg { x0: pair[0].x, y0: pair[0].y, x1: pair[1].x, y1: pair[1].y, w: w.max(0.1) });
+                    }
+                }
+                None => {
+                    // thin filled rectangles are lines (staff lines, stems, barlines); others are beams etc.
+                    if bb.width() < 3.0 && bb.height() > 2.0 * bb.width() {
+                        self.m.segs.push(Seg { x0: bb.center().x, y0: bb.y0, x1: bb.center().x, y1: bb.y1, w: bb.width() });
+                    } else if bb.height() < 3.0 && bb.width() > 2.0 * bb.height() && poly.len() <= 6 && (poly[0].y - bb.center().y).abs() <= bb.height() {
+                        // axis-aligned thin bar (a beam is slanted or thicker; keep both)
+                        self.m.segs.push(Seg { x0: bb.x0, y0: bb.center().y, x1: bb.x1, y1: bb.center().y, w: bb.height() });
+                        self.m.fills.push((bb, poly));
+                    } else {
+                        self.m.fills.push((bb, poly));
+                    }
+                }
+            }
+        }
+    }
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if matches!(draw_mode, DrawMode::Invisible) {
+            return;
+        }
+        for g in run.glyphs() {
+            let t = props.transform * g.transform();
+            let origin = t * Point::ZERO;
+            if std::env::var("VS_DEBUG").is_ok() && self.m.glyphs.len() < 3 { eprintln!("props {:?} glyph {:?}", props.transform.as_coeffs(), g.transform().as_coeffs()); }
+            let up = t * Point::new(0.0, 1000.0) - origin;
+            let size = up.hypot() * GLYPH_SCALE;
+            let ch = match g.as_unicode() {
+                Some(hayro::hayro_interpret::hayro_cmap::BfString::Char(c)) => c,
+                Some(hayro::hayro_interpret::hayro_cmap::BfString::String(s)) => s.chars().next().unwrap_or('\0'),
+                None => char::from_u32(g.char_code()).unwrap_or('\0'),
+            };
+            let u = ch as u32;
+            let (sym, sm) = if (0xE000..=0xF8FF).contains(&u) && !(0xF020..=0xF0FF).contains(&u) {
+                (smufl(u), true)
+            } else {
+                (mac_roman(ch).and_then(sonata), false)
+            };
+            self.m.glyphs.push(Glyph { sym, ch, x: origin.x, y: origin.y, size, smufl: sm });
+        }
+    }
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Extract every glyph and line from each page (coordinates: points, origin top-left, y down).
+pub fn extract(bytes: Vec<u8>) -> Result<Vec<PageMarks>, String> {
+    let pdf = Pdf::new(bytes).map_err(|e| format!("Not a readable PDF: {e:?}"))?;
+    let cache = InterpreterCache::new();
+    let settings = InterpreterSettings::default();
+    let mut pages = vec![];
+    for page in pdf.pages().iter() {
+        let (w, h) = page.render_dimensions();
+        let transform = page.initial_transform(true).to_kurbo();
+        let target = Rect::new(0.0, 0.0, w as f64, h as f64);
+        let mut ctx = Context::new(transform, target, &cache, page.xref(), settings.clone());
+        let mut marks = PageMarks { width: w as f64, height: h as f64, ..Default::default() };
+        interpret_page(page, &mut ctx, &mut Collector { m: &mut marks });
+        // some programs draw the same symbol twice (e.g. arpeggio/cross-staff): keep one
+        let mut seen = std::collections::HashSet::new();
+        marks.glyphs.retain(|g| seen.insert((g.ch as u32, (g.x * 4.0).round() as i64, (g.y * 4.0).round() as i64)));
+        pages.push(marks);
+    }
+    Ok(pages)
+}
+
+// ------------------------------------------------------------------ recognition
+
+#[derive(Clone, Debug)]
+struct Staff {
+    lines: [f64; 5], // y of the 5 lines, top to bottom
+    x0: f64,
+    x1: f64,
+    sp: f64,
+}
+
+impl Staff {
+    fn top(&self) -> f64 {
+        self.lines[0]
+    }
+    fn bottom(&self) -> f64 {
+        self.lines[4]
+    }
+    fn mid(&self) -> f64 {
+        self.lines[2]
+    }
+    /// Staff position in half-spaces above the bottom line (0 = bottom line, 8 = top line).
+    fn step(&self, y: f64) -> i32 {
+        ((self.bottom() - y) / (self.sp / 2.0)).round() as i32
+    }
+}
+
+fn find_staves(m: &PageMarks) -> Vec<Staff> {
+    // long horizontal segments
+    let mut hs: Vec<(f64, f64, f64)> = m
+        .segs
+        .iter()
+        .filter(|s| (s.y0 - s.y1).abs() < 0.6 && (s.x1 - s.x0).abs() > m.width * 0.08)
+        .map(|s| ((s.y0 + s.y1) / 2.0, s.x0.min(s.x1), s.x0.max(s.x1)))
+        .collect();
+    hs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // merge segments on the same y (staff lines are often drawn in pieces)
+    let mut rows: Vec<(f64, f64, f64)> = vec![];
+    for h in hs {
+        match rows.last_mut() {
+            Some(r) if (r.0 - h.0).abs() < 0.5 => {
+                r.1 = r.1.min(h.1);
+                r.2 = r.2.max(h.2);
+            }
+            _ => rows.push(h),
+        }
+    }
+    // runs of equally spaced lines with similar extent; 5 = staff, 6 = guitar tab (skipped)
+    let mut staves = vec![];
+    let mut i = 0;
+    while i + 4 < rows.len() {
+        let g = &rows[i..i + 5];
+        let d: Vec<f64> = g.windows(2).map(|w| w[1].0 - w[0].0).collect();
+        let sp = d.iter().sum::<f64>() / 4.0;
+        let even = d.iter().all(|x| (x - sp).abs() < sp * 0.15) && sp > 3.0 && sp < 20.0;
+        let same_extent = g.iter().all(|r| (r.1 - g[0].1).abs() < sp * 3.0 && (r.2 - g[0].2).abs() < sp * 3.0);
+        if even && same_extent {
+            // tab staff has a 6th line at the same spacing
+            let six = rows.get(i + 5).is_some_and(|r| (r.0 - g[4].0 - sp).abs() < sp * 0.15 && (r.1 - g[0].1).abs() < sp * 3.0);
+            if !six {
+                staves.push(Staff { lines: [g[0].0, g[1].0, g[2].0, g[3].0, g[4].0], x0: g[0].1, x1: g[0].2, sp });
+                i += 5;
+                continue;
+            }
+            i += 6;
+            continue;
+        }
+        i += 1;
+    }
+    staves
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ClefKind {
+    G,
+    F,
+    C,
+}
+
+impl ClefKind {
+    /// Diatonic step number of the bottom staff line (C0 = 0).
+    fn bottom_line(self) -> i32 {
+        match self {
+            ClefKind::G => 4 * 7 + 2, // E4
+            ClefKind::F => 2 * 7 + 4, // G2
+            ClefKind::C => 3 * 7 + 3, // F3 (alto)
+        }
+    }
+}
+
+const STEP_PC: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+const SHARP_ORDER: [usize; 7] = [3, 0, 4, 1, 5, 2, 6];
+const FLAT_ORDER: [usize; 7] = [6, 2, 5, 1, 4, 0, 3];
+
+fn key_alters(f: i32) -> [i32; 7] {
+    let mut a = [0; 7];
+    if f > 0 {
+        for &l in SHARP_ORDER.iter().take(f.min(7) as usize) {
+            a[l] = 1;
+        }
+    } else {
+        for &l in FLAT_ORDER.iter().take((-f).min(7) as usize) {
+            a[l] = -1;
+        }
+    }
+    a
+}
+
+#[derive(Clone, Debug)]
+struct Event {
+    x: f64,
+    /// beats (quarter notes)
+    dur: f64,
+    pitches: Vec<(i32, i32)>, // (diatonic step, explicit alteration or 99 = none)
+    rest: bool,
+    stem_down: Option<bool>,
+    staff: usize,
+    rest_y: Option<f64>,
+}
+
+pub struct ReadReport {
+    pub pages: usize,
+    pub systems: usize,
+    pub measures: usize,
+    pub clean_measures: usize,
+    pub notes: usize,
+}
+
+/// Read a typeset PDF into a Piece. Returns the piece and a quality report.
+pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), String> {
+    let pages = extract(bytes)?;
+    let mut notes: Vec<Note> = vec![];
+    let mut t_global = 0.0f64;
+    let mut ts = (4u32, 4u32);
+    let mut key_fifths = 0i32;
+    let mut have_key = false;
+    let mut have_ts = false;
+    let mut report = ReadReport { pages: pages.len(), systems: 0, measures: 0, clean_measures: 0, notes: 0 };
+    let mut pickup = 0.0;
+    let mut first_measure = true;
+    let mut music_size_seen = 0.0f64;
+    let mut guitar = false;
+    let mut clefs_state: Vec<ClefKind> = vec![];
+
+    for m in &pages {
+        let staves = find_staves(m);
+        if staves.is_empty() {
+            continue;
+        }
+        let sp = staves.iter().map(|s| s.sp).sum::<f64>() / staves.len() as f64;
+        let music_size = 4.0 * sp;
+        music_size_seen = music_size;
+        // systems: staves whose horizontal extent matches and that are joined by a barline at the left
+        let mut systems: Vec<Vec<usize>> = vec![];
+        for (i, s) in staves.iter().enumerate() {
+            let joined = systems.last().and_then(|sys: &Vec<usize>| sys.last()).is_some_and(|&j| {
+                let p = &staves[j];
+                (p.x0 - s.x0).abs() < sp && (p.x1 - s.x1).abs() < sp * 2.0 && {
+                    // a vertical line connecting the two staves
+                    m.segs.iter().any(|g| (g.x0 - g.x1).abs() < 1.0 && (g.x0 - s.x0).abs() < sp * 1.5 && g.y0.min(g.y1) <= p.bottom() + 1.0 && g.y0.max(g.y1) >= s.top() - 1.0)
+                        || m.fills.iter().any(|(bb, _)| bb.x1 <= s.x0 + sp && bb.x0 >= s.x0 - sp * 4.0 && bb.y0 <= p.top() + sp && bb.y1 >= s.bottom() - sp)
+                }
+            });
+            if joined {
+                systems.last_mut().unwrap().push(i);
+            } else {
+                systems.push(vec![i]);
+            }
+        }
+        // music glyphs belong to the nearest staff
+        let near = |y: f64| -> Option<usize> {
+            let mut best = None;
+            let mut bd = f64::MAX;
+            for (i, s) in staves.iter().enumerate() {
+                let d = if y < s.top() { s.top() - y } else if y > s.bottom() { y - s.bottom() } else { 0.0 };
+                if d < bd {
+                    bd = d;
+                    best = Some(i);
+                }
+            }
+            best.filter(|_| bd < sp * 7.0)
+        };
+        let is_music = |g: &Glyph| (g.size - music_size).abs() < music_size * 0.2 || (g.sym.is_some() && g.smufl && g.size > music_size * 0.55);
+        for sys in &systems {
+            report.systems += 1;
+            // use the bottom two staves for piano music (top ones may be a vocal line), else 1
+            let parts: Vec<usize> = if sys.len() >= 2 { sys[sys.len() - 2..].to_vec() } else { sys.clone() };
+            if parts.len() == 1 {
+                guitar = true;
+            }
+            if clefs_state.len() != parts.len() {
+                clefs_state = if parts.len() == 2 { vec![ClefKind::G, ClefKind::F] } else { vec![ClefKind::G] };
+            }
+            let sys_x0 = staves[parts[0]].x0;
+            let sys_x1 = staves[parts[0]].x1;
+            // barlines: thin vertical lines that run exactly from the top to the bottom line of a staff
+            // (or across the whole system), present at the same x in every staff of the system
+            let tops: Vec<f64> = parts.iter().map(|&i| staves[i].top()).collect();
+            let bots: Vec<f64> = parts.iter().map(|&i| staves[i].bottom()).collect();
+            let cand = |st: &Staff| -> Vec<f64> {
+                let mut xs: Vec<f64> = vec![];
+                for g in &m.segs {
+                    if (g.x0 - g.x1).abs() > 0.8 || g.x0 < sys_x0 + sp * 0.5 {
+                        continue;
+                    }
+                    let (ya, yb) = (g.y0.min(g.y1), g.y0.max(g.y1));
+                    let covers = ya <= st.top() + sp * 0.35 && yb >= st.bottom() - sp * 0.35;
+                    let on_line = |y: f64| tops.iter().chain(bots.iter()).any(|t| (y - t).abs() < sp * 0.35);
+                    let ends_on_lines = on_line(ya) && on_line(yb);
+                    if covers && ends_on_lines {
+                        xs.push(g.x0);
+                    }
+                }
+                xs
+            };
+            let mut bars: Vec<f64> = cand(&staves[parts[0]]);
+            if parts.len() >= 2 {
+                let other = cand(&staves[parts[1]]);
+                bars.retain(|x| other.iter().any(|o| (o - x).abs() < sp * 0.6));
+            }
+            bars.push(sys_x1);
+            bars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            bars.dedup_by(|a, b| (*a - *b).abs() < sp * 0.8);
+
+            // collect glyphs per staff
+            let mut per_staff: Vec<Vec<&Glyph>> = vec![vec![]; parts.len()];
+            for g in &m.glyphs {
+                if g.sym.is_none() || g.x < sys_x0 - sp || g.x > sys_x1 + sp {
+                    continue;
+                }
+                if let Some(si) = near(g.y) {
+                    if let Some(pi) = parts.iter().position(|p| *p == si) {
+                        per_staff[pi].push(g);
+                    }
+                }
+            }
+            for v in per_staff.iter_mut() {
+                v.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            // first notehead/rest x in the system: everything before it is clef/key/time
+            let first_event_x = per_staff
+                .iter()
+                .flat_map(|v| v.iter())
+                .filter(|g| matches!(g.sym, Some(Sym::HeadBlack | Sym::HeadHalf | Sym::HeadWhole | Sym::RestWhole | Sym::RestHalf | Sym::RestQuarter | Sym::Rest8 | Sym::Rest16)) && is_music(g))
+                .map(|g| g.x)
+                .fold(f64::MAX, f64::min);
+
+            // clefs, key signature and time signature at the start of the system
+            for (pi, gl) in per_staff.iter().enumerate() {
+                let st = &staves[parts[pi]];
+                let mut sharps = 0;
+                let mut flats = 0;
+                let mut digits: Vec<(f64, f64, u8)> = vec![];
+                for g in gl.iter().filter(|g| g.x < first_event_x - sp * 0.3) {
+                    match g.sym {
+                        Some(Sym::ClefG) if g.size > music_size * 0.6 => {
+                            clefs_state[pi] = ClefKind::G;
+                            if g.ch as u32 == 0xE052 {
+                                guitar = true;
+                            }
+                        }
+                        Some(Sym::ClefF) if g.size > music_size * 0.6 => clefs_state[pi] = ClefKind::F,
+                        Some(Sym::ClefC) if g.size > music_size * 0.6 => clefs_state[pi] = ClefKind::C,
+                        Some(Sym::Sharp) if is_music(g) => sharps += 1,
+                        Some(Sym::Flat) if is_music(g) => flats += 1,
+                        Some(Sym::TimeDigit(d)) if is_music(g) && g.y > st.top() - sp && g.y < st.bottom() + sp => digits.push((g.x, g.y, d)),
+                        Some(Sym::CommonTime) if is_music(g) => {
+                            ts = (4, 4);
+                            have_ts = true;
+                        }
+                        Some(Sym::CutTime) if is_music(g) => {
+                            ts = (2, 2);
+                            have_ts = true;
+                        }
+                        _ => {}
+                    }
+                }
+                // a small "8" under a treble clef = guitar clef (sounds an octave lower)
+                if m.glyphs.iter().any(|g| g.ch == '8' && g.x < first_event_x && g.y > st.bottom() && g.y < st.bottom() + sp * 3.0 && g.x < st.x0 + sp * 5.0) {
+                    guitar = true;
+                }
+                if pi == 0 && (sharps > 0 || flats > 0 || !have_key) {
+                    let k = if sharps > 0 { sharps } else { -flats };
+                    if !have_key || k != 0 {
+                        key_fifths = k.clamp(-7, 7);
+                        have_key = true;
+                    }
+                }
+                if !digits.is_empty() {
+                    let top: Vec<u8> = digits.iter().filter(|d| d.1 < st.mid()).map(|d| d.2).collect();
+                    let bot: Vec<u8> = digits.iter().filter(|d| d.1 > st.mid()).map(|d| d.2).collect();
+                    let num = top.iter().fold(0u32, |a, d| a * 10 + *d as u32);
+                    let den = bot.iter().fold(0u32, |a, d| a * 10 + *d as u32);
+                    if num > 0 && [1, 2, 4, 8, 16].contains(&den) {
+                        ts = (num, den);
+                        have_ts = true;
+                    }
+                }
+            }
+            let _ = have_ts;
+            let bar_len = ts.0 as f64 * 4.0 / ts.1 as f64;
+            let alters = key_alters(key_fifths);
+
+            // per measure
+            for mi in 0..bars.len() {
+                let mx0 = if mi == 0 { first_event_x - sp * 0.5 } else { bars[mi - 1] };
+                let mx1 = bars[mi];
+                if mx1 - mx0 < sp * 1.5 || mx1 < first_event_x {
+                    continue;
+                }
+                let mut events: Vec<Event> = vec![];
+                for (pi, gl) in per_staff.iter().enumerate() {
+                    let st = &staves[parts[pi]];
+                    let mut accs: Vec<(f64, i32, i32)> = vec![]; // x, step, alteration
+                    let mut clef = clefs_state[pi];
+                    let in_measure: Vec<&&Glyph> = gl.iter().filter(|g| g.x >= mx0 - sp * 0.2 && g.x < mx1).collect();
+                    // clef changes inside the measure
+                    for g in &in_measure {
+                        let s = st.step(g.y);
+                        match g.sym {
+                            Some(Sym::ClefG) => clef = ClefKind::G,
+                            Some(Sym::ClefF) => clef = ClefKind::F,
+                            Some(Sym::ClefC) => clef = ClefKind::C,
+                            Some(Sym::Sharp) if is_music(g) => accs.push((g.x, s, 1)),
+                            Some(Sym::Flat) if is_music(g) => accs.push((g.x, s, -1)),
+                            Some(Sym::Natural) if is_music(g) => accs.push((g.x, s, 0)),
+                            Some(Sym::DoubleSharp) if is_music(g) => accs.push((g.x, s, 2)),
+                            Some(Sym::DoubleFlat) if is_music(g) => accs.push((g.x, s, -2)),
+                            _ => {}
+                        }
+                    }
+                    clefs_state[pi] = clef;
+                    // noteheads → events (grouped by stem)
+                    let heads: Vec<&&Glyph> = in_measure.iter().copied().filter(|g| matches!(g.sym, Some(Sym::HeadBlack | Sym::HeadHalf | Sym::HeadWhole)) && g.size > music_size * 0.8).collect();
+                    let mut used = vec![false; heads.len()];
+                    for (hi, h) in heads.iter().enumerate() {
+                        if used[hi] {
+                            continue;
+                        }
+                        let head_w = sp * 1.18;
+                        let base = match h.sym {
+                            Some(Sym::HeadWhole) => 4.0,
+                            Some(Sym::HeadHalf) => 2.0,
+                            _ => 1.0,
+                        };
+                        // chord members: heads at (almost) the same x, or touching (seconds)
+                        let mut chord = vec![hi];
+                        for (hj, h2) in heads.iter().enumerate() {
+                            if hj != hi && !used[hj] && h2.sym == h.sym && (h2.x - h.x).abs() < head_w * 1.1 {
+                                // must share a stem: same stem side – approximate by vertical proximity
+                                if (h2.y - h.y).abs() < sp * 8.0 {
+                                    chord.push(hj);
+                                }
+                            }
+                        }
+                        for &c in &chord {
+                            used[c] = true;
+                        }
+                        let cx_left = chord.iter().map(|&c| heads[c].x).fold(f64::MAX, f64::min);
+                        let ys: Vec<f64> = chord.iter().map(|&c| heads[c].y).collect();
+                        let (ymin, ymax) = (ys.iter().cloned().fold(f64::MAX, f64::min), ys.iter().cloned().fold(f64::MIN, f64::max));
+                        // stem: vertical segment starting at a head edge
+                        let mut stem: Option<(f64, f64, bool)> = None; // x, far y, down
+                        let mut best_d: Option<f64> = None;
+                        if base < 4.0 {
+                            for g in &m.segs {
+                                if (g.x0 - g.x1).abs() > 0.8 || g.w > sp * 0.4 {
+                                    continue;
+                                }
+                                let (ya, yb) = (g.y0.min(g.y1), g.y0.max(g.y1));
+                                let len = yb - ya;
+                                if len < sp * 1.8 || len > sp * 14.0 {
+                                    continue;
+                                }
+                                let x = g.x0;
+                                // stems sit on the left edge (down) or right edge (up) of a notehead
+                                let edge_d = (x - cx_left).abs().min((x - (cx_left + head_w)).abs());
+                                if edge_d > sp * 0.4 {
+                                    continue;
+                                }
+                                // the stem overlaps the chord vertically and sticks out on one side
+                                if ya > ymax + sp * 0.6 || yb < ymin - sp * 0.6 {
+                                    continue;
+                                }
+                                let above = ymin - ya;
+                                let below = yb - ymax;
+                                let cand = if above > sp * 1.5 && above >= below {
+                                    Some((x, ya, false))
+                                } else if below > sp * 1.5 {
+                                    Some((x, yb, true))
+                                } else {
+                                    None
+                                };
+                                if let Some(c) = cand {
+                                    if best_d.is_none_or(|d| edge_d < d) {
+                                        best_d = Some(edge_d);
+                                        stem = Some(c);
+                                    }
+                                }
+                            }
+                        }
+                        let mut dur = base;
+                        if let Some((sx, sy, down)) = stem {
+                            if base == 1.0 {
+                                // beams crossing the stem near its far end
+                                let mut beams = 0;
+                                for (bb, _) in &m.fills {
+                                    if bb.x0 - 0.5 <= sx && bb.x1 + 0.5 >= sx && bb.width() > sp * 0.8 && bb.height() < sp * 4.0 {
+                                        let reach = if down { sy - bb.y0 } else { bb.y1 - sy };
+                                        if reach > -sp * 0.3 && reach < sp * 2.6 {
+                                            // count distinct beam bands
+                                            beams += 1;
+                                        }
+                                    }
+                                }
+                                // flags
+                                let flags = m
+                                    .glyphs
+                                    .iter()
+                                    .filter_map(|g| match g.sym {
+                                        Some(Sym::Flag(n)) if (g.x - sx).abs() < sp * 0.6 && (g.y - sy).abs() < sp * 1.5 => Some(n),
+                                        _ => None,
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                let n = (beams.min(4) as u8).max(flags);
+                                dur = 1.0 / f64::powi(2.0, n as i32);
+                            }
+                        }
+                        // dots
+                        let dots = in_measure
+                            .iter()
+                            .filter(|g| g.sym == Some(Sym::Dot) && g.x > cx_left + head_w * 0.8 && g.x < cx_left + head_w + sp * 1.8 && g.y > ymin - sp * 0.9 && g.y < ymax + sp * 0.9)
+                            .map(|g| (g.x * 10.0).round() as i64)
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len();
+                        if dots >= 2 {
+                            dur *= 1.75;
+                        } else if dots == 1 {
+                            dur *= 1.5;
+                        }
+                        let pitches: Vec<(i32, i32)> = chord
+                            .iter()
+                            .map(|&c| {
+                                let s = st.step(heads[c].y);
+                                let acc = accs.iter().filter(|a| a.1 == s && a.0 < heads[c].x && heads[c].x - a.0 < sp * 4.0).map(|a| a.2).next_back().unwrap_or(99);
+                                (clef.bottom_line() + s, acc)
+                            })
+                            .collect();
+                        events.push(Event { x: cx_left, dur, pitches, rest: false, stem_down: stem.map(|s| s.2), staff: pi, rest_y: None });
+                    }
+                    // rests
+                    for g in &in_measure {
+                        let d = match g.sym {
+                            Some(Sym::RestWhole) => bar_len,
+                            Some(Sym::RestHalf) => 2.0,
+                            Some(Sym::RestQuarter) => 1.0,
+                            Some(Sym::Rest8) => 0.5,
+                            Some(Sym::Rest16) => 0.25,
+                            Some(Sym::Rest32) => 0.125,
+                            _ => continue,
+                        };
+                        if !is_music(g) {
+                            continue;
+                        }
+                        let dotted = in_measure.iter().any(|o| o.sym == Some(Sym::Dot) && o.x > g.x && o.x < g.x + sp * 2.5 && (o.y - g.y).abs() < sp * 1.5);
+                        events.push(Event { x: g.x, dur: if dotted { d * 1.5 } else { d }, pitches: vec![], rest: true, stem_down: None, staff: pi, rest_y: Some(g.y) });
+                    }
+                    // apply accidentals "for the rest of the measure"
+                    let _ = &accs;
+                }
+                // triplets: tuplet digits near events
+                for g in m.glyphs.iter().filter(|g| matches!(g.sym, Some(Sym::TupletDigit(3))) || (g.ch == '3' && g.size < music_size * 0.7 && g.size > music_size * 0.2)) {
+                    if g.x < mx0 || g.x > mx1 {
+                        continue;
+                    }
+                    let mut idx: Vec<usize> = events.iter().enumerate().filter(|(_, e)| (e.x - g.x).abs() < sp * 3.5 && !e.rest).map(|(i, _)| i).collect();
+                    if idx.len() >= 3 {
+                        idx.sort_by(|a, b| (events[*a].x - g.x).abs().partial_cmp(&(events[*b].x - g.x).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                        for &i in idx.iter().take(3) {
+                            if events[i].dur < 2.0 {
+                                events[i].dur *= 2.0 / 3.0;
+                            }
+                        }
+                    }
+                }
+                if events.is_empty() {
+                    continue;
+                }
+                report.measures += 1;
+                // Timing: every staff (and every voice in it) fills the bar by itself.
+                let mut onset = vec![0.0f64; events.len()];
+                let mut totals: Vec<f64> = vec![];
+                let mut staff_clean = true;
+                for pi in 0..parts.len() {
+                    let mine: Vec<usize> = {
+                        let mut v: Vec<usize> = (0..events.len()).filter(|&i| events[i].staff == pi).collect();
+                        v.sort_by(|a, b| events[*a].x.partial_cmp(&events[*b].x).unwrap_or(std::cmp::Ordering::Equal));
+                        v
+                    };
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    // lay out a list of events as one voice: columns by x, step = shortest event in the column
+                    let lay = |ids: &[usize], onset: &mut Vec<f64>| -> f64 {
+                        let mut cols: Vec<(f64, Vec<usize>)> = vec![];
+                        for &i in ids {
+                            match cols.last_mut() {
+                                Some(c) if (events[i].x - c.0).abs() < sp * 0.9 => c.1.push(i),
+                                _ => cols.push((events[i].x, vec![i])),
+                            }
+                        }
+                        let mut t = 0.0;
+                        let mut end: f64 = 0.0;
+                        for c in &cols {
+                            for &i in &c.1 {
+                                onset[i] = t;
+                                end = end.max(t + events[i].dur);
+                            }
+                            let step = c.1.iter().map(|&i| events[i].dur).fold(f64::MAX, f64::min);
+                            t += step;
+                        }
+                        t.max(end.min(t + 1e-9)).max(if (end - bar_len).abs() < 1e-3 { bar_len } else { t })
+                    };
+                    let total_a = lay(&mine, &mut onset);
+                    if (total_a - bar_len).abs() < 1e-3 {
+                        totals.push(total_a);
+                        continue;
+                    }
+                    // two voices: stems up / stems down (rests by height)
+                    let mid = staves[parts[pi]].mid();
+                    let (up, down): (Vec<usize>, Vec<usize>) = mine.iter().partition(|&&i| match events[i].stem_down {
+                        Some(d) => !d,
+                        None => events[i].rest_y.map(|y| y < mid).unwrap_or(true),
+                    });
+                    let mut on_b = onset.clone();
+                    let tu = if up.is_empty() { bar_len } else { lay(&up, &mut on_b) };
+                    let td = if down.is_empty() { bar_len } else { lay(&down, &mut on_b) };
+                    if (tu - bar_len).abs() < 1e-3 && (td - bar_len).abs() < 1e-3 {
+                        onset = on_b;
+                        totals.push(bar_len);
+                        continue;
+                    }
+                    staff_clean = false;
+                    totals.push(total_a);
+                }
+                let total = totals.iter().cloned().fold(0.0, f64::max);
+                let clean = staff_clean;
+                if std::env::var("VS_DEBUG").is_ok() && !clean && report.measures <= 40 {
+                    eprintln!("measure {} ts {:?} totals {:?} bar {:.2}", report.measures, ts, totals, bar_len);
+                    for (i, e) in events.iter().enumerate() {
+                        eprintln!("   x{:.0} s{} t{:.3} {}{:.3} {:?} down={:?}", e.x, e.staff, onset[i], if e.rest { "R" } else { "" }, e.dur, e.pitches.iter().map(|p| p.0).collect::<Vec<_>>(), e.stem_down);
+                    }
+                }
+                let mut scale = 1.0;
+                if clean {
+                    report.clean_measures += 1;
+                } else if first_measure && total < bar_len {
+                    pickup = total;
+                } else if total > 0.0 {
+                    scale = bar_len / total;
+                }
+                let m_len = if first_measure && total < bar_len - 1e-3 { total } else { bar_len };
+                first_measure = false;
+                // emit notes, accidentals carried within the measure per staff/step
+                let mut carried: std::collections::HashMap<(usize, i32), i32> = std::collections::HashMap::new();
+                let mut order: Vec<usize> = (0..events.len()).collect();
+                order.sort_by(|a, b| events[*a].x.partial_cmp(&events[*b].x).unwrap_or(std::cmp::Ordering::Equal));
+                for &i in &order {
+                    let e = &events[i];
+                    if e.rest {
+                        continue;
+                    }
+                    for &(step, acc) in &e.pitches {
+                        let alt = if acc != 99 {
+                            carried.insert((e.staff, step), acc);
+                            acc
+                        } else {
+                            *carried.get(&(e.staff, step)).unwrap_or(&alters[step.rem_euclid(7) as usize])
+                        };
+                        let mut pitch = (step.div_euclid(7) + 1) * 12 + STEP_PC[step.rem_euclid(7) as usize] + alt;
+                        if guitar {
+                            pitch -= 12;
+                        }
+                        let hand = if parts.len() >= 2 {
+                            if e.staff == 0 { Hand::Right } else { Hand::Left }
+                        } else {
+                            match e.stem_down {
+                                Some(true) => Hand::Left,
+                                Some(false) => Hand::Right,
+                                None => if pitch < 55 { Hand::Left } else { Hand::Right },
+                            }
+                        };
+                        notes.push(Note::new(t_global + onset[i] * scale, (e.dur * scale).max(0.1), pitch.clamp(21, 108) as u8, hand, None));
+                        report.notes += 1;
+                    }
+                }
+                t_global += m_len;
+            }
+        }
+    }
+    let _ = music_size_seen;
+    if notes.is_empty() {
+        return Err("No typeset music found. This looks like a scanned (picture) PDF – use 'Make playable' (Audiveris) for scans.".into());
+    }
+    // a single guitar line with no stems pointing down: split by pitch instead
+    if guitar && !notes.iter().any(|n| n.hand == Hand::Left) {
+        for n in &mut notes {
+            if n.pitch < 55 {
+                n.hand = Hand::Left;
+            }
+        }
+    }
+    let mut p = Piece {
+        id: String::new(),
+        title: title.to_string(),
+        composer: String::new(),
+        notes_text: if guitar {
+            "Read from a guitar score: bass notes (stems down) go to the left hand; played an octave lower, as a guitar sounds.".into()
+        } else {
+            "Read directly from the typeset PDF. Check tricky bars against the page.".into()
+        },
+        bpm: 90.0,
+        ts_num: ts.0,
+        ts_den: ts.1,
+        key_fifths,
+        minor: false,
+        pickup: if pickup > 0.0 { pickup } else { 0.0 },
+        notes,
+        origin: Origin::BuiltIn,
+        key_changes: vec![],
+    };
+    p.minor = crate::import::guess_minor(&p.notes, key_fifths);
+    p.sort_notes();
+    Ok((p, report))
+}
+
+/// Quick check: does this PDF contain typeset music (vector music-font glyphs)?
+pub fn is_typeset(bytes: Vec<u8>) -> bool {
+    extract(bytes).map(|pages| pages.iter().take(2).any(|p| p.glyphs.iter().filter(|g| matches!(g.sym, Some(Sym::HeadBlack | Sym::HeadHalf))).count() > 8)).unwrap_or(false)
+}
+
+#[allow(dead_code)]
+pub fn debug_dump(bytes: Vec<u8>) {
+    if let Ok(pages) = extract(bytes) {
+        for (i, p) in pages.iter().enumerate().take(1) {
+            let staves = find_staves(p);
+            println!("page {i}: {} glyphs, {} segs, {} fills, {} staves", p.glyphs.len(), p.segs.len(), p.fills.len(), staves.len());
+            for s in staves.iter().take(4) {
+                println!("  staff y {:?} x {:.0}-{:.0} sp {:.2}", s.lines.map(|v| v.round()), s.x0, s.x1, s.sp);
+            }
+            let mut sizes: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+            for g in &p.glyphs {
+                let k = format!("{:?}", g.sym);
+                let e = sizes.entry(k).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 = g.size;
+            }
+            for (k, v) in sizes {
+                println!("  {k}: {} (size {:.1})", v.0, v.1);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn debug_bars(bytes: Vec<u8>) {
+    if let Ok(pages) = extract(bytes) {
+        let m = &pages[0];
+        let st = find_staves(m);
+        let (t, b) = (st[0].top(), st[1].bottom());
+        eprintln!("staff0 {:.1}-{:.1} staff1 {:.1}-{:.1}", st[0].top(), st[0].bottom(), st[1].top(), st[1].bottom());
+        let mut v: Vec<&Seg> = m.segs.iter().filter(|g| (g.x0 - g.x1).abs() < 0.8 && g.y0.min(g.y1) < b + 5.0 && g.y0.max(g.y1) > t - 5.0 && (g.y0 - g.y1).abs() > 12.0).collect();
+        v.sort_by(|a, c| a.x0.partial_cmp(&c.x0).unwrap());
+        for g in v.iter().take(60) {
+            eprintln!("x {:.1} y {:.1}-{:.1} w {:.2}", g.x0, g.y0.min(g.y1), g.y0.max(g.y1), g.w);
+        }
+        let fills: Vec<_> = m.fills.iter().filter(|(bb, _)| bb.width() < 3.0 && bb.y0 < b && bb.y1 > t).take(10).collect();
+        for (bb, _) in fills { eprintln!("fill {:?}", bb); }
+    }
+}

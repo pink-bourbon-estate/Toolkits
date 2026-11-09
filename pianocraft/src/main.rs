@@ -10,9 +10,13 @@ mod install;
 mod midi_in;
 mod model;
 mod notation;
+mod repertoire;
+mod startlog;
 mod transform;
 mod ui;
 mod updater;
+#[allow(dead_code)]
+mod vecscore;
 #[cfg(test)]
 mod tests;
 
@@ -36,6 +40,26 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     match args.get(1).map(|s| s.as_str()) {
+        Some("--readpdf") if args.len() >= 3 => {
+            let bytes = std::fs::read(&args[2]).unwrap_or_default();
+            if args.iter().any(|a| a == "--bars") { vecscore::debug_bars(bytes.clone()); return Ok(()); }
+            if args.iter().any(|a| a == "--dump") {
+                vecscore::debug_dump(bytes.clone());
+            }
+            match vecscore::read_pdf(bytes, "test") {
+                Ok((p, r)) => {
+                    println!("pages {} systems {} measures {} clean {} ({:.0}%) notes {} | {} {}/{} bars {} RH {} LH {}",
+                        r.pages, r.systems, r.measures, r.clean_measures, 100.0 * r.clean_measures as f64 / r.measures.max(1) as f64, r.notes,
+                        p.key_name(), p.ts_num, p.ts_den, p.bar_count(),
+                        p.notes.iter().filter(|n| n.hand == model::Hand::Right).count(), p.notes.iter().filter(|n| n.hand == model::Hand::Left).count());
+                    if let Some(out) = args.get(3).filter(|a| !a.starts_with("--")) {
+                        let _ = std::fs::write(out, serde_json::to_string(&p).unwrap_or_default());
+                    }
+                }
+                Err(e) => println!("ERROR: {e}"),
+            }
+            return Ok(());
+        }
         Some("--version") => {
             println!("PianoCraft {}", updater::version_label());
             return Ok(());
@@ -67,8 +91,10 @@ fn main() -> eframe::Result<()> {
         }
         _ => {}
     }
+    startlog::log(&format!("launch {}", updater::version_label()));
     updater::cleanup();
-    install::refresh_registration();
+    // registry/shortcut upkeep can be slow (PowerShell): never block the window on it
+    std::thread::spawn(install::refresh_registration);
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon64.rgba").to_vec(), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -79,5 +105,10 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("PianoCraft", opts, Box::new(|cc| Ok(Box::new(ui::app::App::new(cc)))))
+    let r = eframe::run_native("PianoCraft", opts, Box::new(|cc| Ok(Box::new(ui::app::App::new(cc)))));
+    if let Err(e) = &r {
+        startlog::log(&format!("window error: {e}"));
+    }
+    // make sure nothing lingers in the background after the window closes
+    std::process::exit(if r.is_ok() { 0 } else { 1 });
 }

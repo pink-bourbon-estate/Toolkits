@@ -380,3 +380,7 @@ pub fn import_musicxml(xml: &str, fallback_title: &str) -> Result<Piece, String>
 pub fn unzip_for_omr(bytes: &[u8]) -> Result<String, String> {
     unzip_mxl(bytes)
 }
+
+pub fn guess_minor(notes: &[Note], fifths: i32) -> bool {
+    ends_on_relative_minor(notes, fifths)
+}
