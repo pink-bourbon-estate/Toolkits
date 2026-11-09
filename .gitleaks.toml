@@ -1,0 +1,10 @@
+# Secret scanning for every push (see .github/workflows). Uses gitleaks' built-in rules for API
+# keys, tokens, passwords and private keys, plus a rule that blocks personal email addresses.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "personal-email"
+description = "Personal email address in the code"
+regex = '''(?i)[a-z0-9._%+-]+@(gmail|googlemail|outlook|hotmail|live|yahoo|icloud|me|proton|protonmail|aol)\.[a-z.]{2,}'''
+keywords = ["@"]
