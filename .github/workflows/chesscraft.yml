@@ -1,0 +1,87 @@
+name: chesscraft
+on:
+  push:
+    branches: [main]
+    paths: ['chesscraft/**', '.github/workflows/chesscraft.yml', '.gitleaks.toml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (keys, tokens, passwords, personal emails)
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+  build:
+    needs: secrets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bin: chesscraft.exe
+            asset: chesscraft.exe
+          - os: ubuntu-22.04
+            bin: chesscraft
+            asset: chesscraft-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: chesscraft
+    env:
+      # Baked into the binary so the in-app updater knows which version it is (v0.1.N).
+      CHESSCRAFT_BUILD: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev libasound2-dev
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Package with checksum
+        shell: bash
+        run: |
+          mkdir -p ../dist
+          cp "target/release/${{ matrix.bin }}" "../dist/${{ matrix.asset }}"
+          cd ../dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chesscraft-${{ runner.os }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          gh release create "chesscraft-v0.1.${{ github.run_number }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "ChessCraft v0.1.${{ github.run_number }}" \
+            --notes "${NOTES:-Manual build}"
+      - name: Keep the 10 newest ChessCraft releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "${{ github.repository }}" --limit 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("chesscraft-v"))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' |
+          while read -r tag; do
+            gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag
+          done

@@ -5,6 +5,7 @@ Small desktop tools, built in Rust with egui. Each tool lives in its own folder,
 | Tool | What it does | Download |
 | --- | --- | --- |
 | [PianoCraft](pianocraft/) | Piano practice companion: Russian School course with Nahre Sol's approach, sheet + falling notes, scales in every mode, adaptive difficulty, book viewer with annotations | [Releases](https://github.com/pink-bourbon-estate/toolkits/releases) (`pianocraft-v0.1.N`) |
+| [ChessCraft](chesscraft/) | Chess opening trainer for the Modern Defence (Black) and the London System (White): a full Stockfish-generated and move-checked line tree, Explore/Learn/Drill modes, and honest spaced repetition | [Releases](https://github.com/pink-bourbon-estate/toolkits/releases) (`chesscraft-v0.1.N`) |
 
 ## Privacy and security
 - No accounts, telemetry or tracking. The only network use is the optional update check (anonymous download from github.com), plus links you click yourself.
