@@ -1,0 +1,36 @@
+[package]
+name = "pianocraft"
+version = "0.1.0"
+edition = "2021"
+description = "A Russian-school piano practice companion: falling notes + sheet, adaptive difficulty, transposition, looping."
+license = "MIT"
+repository = "https://github.com/pink-bourbon-estate/toolkits"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11"] }
+egui = "0.31"
+cpal = "0.16"
+midir = "0.10"
+midly = "0.5"
+roxmltree = "0.20"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+webbrowser = "1"
+hayro = "0.9"
+ureq = { version = "3", features = ["platform-verifier"] }
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+rfd = "0.15"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

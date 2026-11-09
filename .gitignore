@@ -1,0 +1,21 @@
+# build output
+target/
+**/target/
+# local cross-compile settings
+.cargo/
+# never commit personal files, music, books or app data
+*.pdf
+*.mid
+*.midi
+*.mxl
+*.musicxml
+progress.json
+annotations.json
+# secrets
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
