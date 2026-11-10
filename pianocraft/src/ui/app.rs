@@ -105,6 +105,15 @@ pub struct App {
     /// Pages Audiveris couldn't read this session (so they aren't retried automatically).
     page_failed: HashSet<String>,
     tech_mode: bool,
+    pdf_cache: std::cell::RefCell<Option<std::rc::Rc<workspace::PdfCache>>>,
+    /// A file that wasn't where we expected when you opened it (asks you to relink it).
+    missing: Option<PathBuf>,
+    missing_edit: String,
+    missing_item: Option<Item>,
+    relink_folder: String,
+    exists_cache: std::cell::RefCell<std::collections::HashMap<PathBuf, bool>>,
+    /// The last few pieces opened (notes are read from disk only when a piece is opened).
+    piece_cache: std::cell::RefCell<std::collections::HashMap<String, Piece>>,
     /// Folder conversions: also send scanned books to Audiveris (slow).
     conv_scans: bool,
     /// Convert again even if a PDF is already in the Library.
@@ -213,6 +222,13 @@ impl App {
             conv_target: None,
             page_failed: HashSet::new(),
             tech_mode: false,
+            pdf_cache: Default::default(),
+            missing: None,
+            missing_edit: String::new(),
+            missing_item: None,
+            relink_folder: String::new(),
+            exists_cache: Default::default(),
+            piece_cache: Default::default(),
             conv_scans: false,
             conv_redo: false,
             conv_open: false,
@@ -230,7 +246,9 @@ impl App {
         }
         crate::startlog::log("window ready");
         app.item = Some(Item::Unit(app.unit_sel));
-        app.rescan_pdfs();
+        if app.progress.pdf_index.is_empty() {
+            app.rescan_pdfs();
+        }
         app.dev_hooks();
         app.audio.send(Cmd::Volume(app.volume));
         app.audio.send(Cmd::CountIn(app.count_in));
@@ -358,7 +376,20 @@ impl App {
     }
 
     fn find_piece(&self, id: &str) -> Option<Piece> {
-        self.builtins.iter().chain(self.progress.library.iter()).find(|p| p.id == id).cloned()
+        if let Some(p) = self.builtins.iter().find(|p| p.id == id) {
+            return Some(p.clone());
+        }
+        if let Some(p) = self.piece_cache.borrow().get(id) {
+            return Some(p.clone());
+        }
+        // read from disk only now, when it's opened (and keep the last few)
+        let p = self.progress.load_piece(id)?;
+        let mut c = self.piece_cache.borrow_mut();
+        if c.len() >= 4 {
+            c.clear();
+        }
+        c.insert(id.to_string(), p.clone());
+        Some(p)
     }
 
     fn open_piece(&mut self, piece: Piece, is_drill: bool, book_piece: Option<u32>) {
@@ -507,9 +538,8 @@ impl App {
                     let d = rate(&p);
                     last = Some(p.id.clone());
                     self.msg = format!("Imported '{}' – difficulty {:.1}/10. It's under 'Your files' on the left.", p.title, d.score);
-                    self.progress.library.retain(|x| x.id != p.id);
-                    self.progress.library.push(p);
-                    self.progress.library_changed();
+                    self.piece_cache.borrow_mut().remove(&p.id);
+                    self.progress.add_piece(p);
                     self.progress.save();
                 }
                 Err(e) => self.msg = format!("{}: {e}", path.display()),
@@ -559,7 +589,6 @@ impl App {
                 }
                 ConvMsg::Piece(p, job) => {
                     c.made += 1;
-                    self.progress.library.retain(|x| x.id != p.id);
                     if let Some((a, b)) = job.pages {
                         if a == b {
                             let key = workspace::page_key(&job.pdf, a);
@@ -570,7 +599,8 @@ impl App {
                         }
                     }
                     last_piece = Some((*p).clone());
-                    self.progress.library.push(*p);
+                    self.piece_cache.borrow_mut().remove(&p.id);
+                    self.progress.add_piece(*p);
                     changed = true;
                 }
                 ConvMsg::Skipped { pdf, why } => {
@@ -643,6 +673,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
+        if std::env::var("PIANOCRAFT_FRAMETIME").is_ok() {
+            eprintln!("frame gap {:.1} ms", dt * 1000.0);
+        }
         self.last_frame = now;
         let playing = self.audio.shared.playing.load(Ordering::Relaxed);
         if playing {
@@ -725,6 +758,7 @@ impl eframe::App for App {
             });
         }
 
+        self.missing_dialog(ctx);
         match self.tab {
             Tab::Main => self.ui_main(ctx),
             Tab::Settings => {
@@ -1200,6 +1234,8 @@ impl App {
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<&str> = None;
+        let mut relink_one: Option<(String, String)> = None;
+        let mut remove_piece: Option<String> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Version, updates and install");
             card(ui, |ui| {
@@ -1273,8 +1309,24 @@ impl App {
                 }
             });
             ui.add_space(12.0);
-            ui.heading("Your books");
-            ui.label("The course opens your own copies at the right page. PianoCraft finds them in your music folders by name; if one isn't found, point to it here.");
+            ui.heading("Your loaded resources");
+            ui.label("The books the course uses, and where they are. They're checked when you open them; if one has moved, you'll be asked to relink it.");
+            card(ui, |ui| {
+                ui.label(RichText::new("Moved your music (say, to another drive)?").strong());
+                ui.label(RichText::new("Pick the folder it's in now. PianoCraft finds every book and PDF it knows by file name – sub-folders included – and updates all the links, including the pages you've made playable and your notes.").small());
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.relink_folder).desired_width(460.0).hint_text(r"D:\Music"));
+                    #[cfg(windows)]
+                    if ui.button("Choose folder…").clicked() {
+                        if let Some(f) = rfd::FileDialog::new().pick_folder() {
+                            self.relink_folder = f.display().to_string();
+                        }
+                    }
+                    if ui.add_enabled(!self.relink_folder.trim().is_empty(), egui::Button::new("🔗 Relink everything")).clicked() {
+                        action = Some("relink_all");
+                    }
+                });
+            });
             ui.horizontal(|ui| {
                 if ui.button("Find my books in my music folders").clicked() {
                     let mut n = 0;
@@ -1288,10 +1340,21 @@ impl App {
                     self.progress.save();
                 }
             });
+            // status is only what's been checked (when a file was opened, or with 'Check them all') –
+            // nothing here touches the disk by itself
+            let status = |p: Option<PathBuf>| -> RichText {
+                match p.and_then(|p| self.exists_cache.borrow().get(&p).copied()) {
+                    Some(true) => RichText::new("✔").color(green()),
+                    Some(false) => RichText::new("missing").color(Color32::LIGHT_RED),
+                    None => RichText::new("·").weak(),
+                }
+            };
+            if ui.small_button("Check them all now").on_hover_text("✔ = found, missing = not where it was, · = not checked yet").clicked() {
+                action = Some("check_files");
+            }
             egui::Grid::new("books").num_columns(3).spacing(Vec2::new(10.0, 6.0)).show(ui, |ui| {
                 for b in BookId::ALL {
-                    let found = self.progress.book_path(b).is_some();
-                    ui.label(if found { RichText::new("✔").color(green()) } else { RichText::new("×").color(Color32::LIGHT_RED) });
+                    ui.label(status(self.progress.book_path(b)));
                     ui.label(b.title());
                     let mut path = self.progress.books.get(&b).cloned().unwrap_or_default();
                     ui.horizontal(|ui| {
@@ -1309,6 +1372,39 @@ impl App {
                     });
                     ui.end_row();
                 }
+            });
+            // everything else you've made playable or imported
+            let files: Vec<(String, String, String)> = self
+                .progress
+                .library
+                .iter()
+                .filter_map(|p| match &p.origin {
+                    Origin::Imported(o) => Some((p.id.clone(), p.title.clone(), o.clone())),
+                    _ => None,
+                })
+                .collect();
+            egui::CollapsingHeader::new(format!("Pieces and PDFs you've made playable or imported ({})", files.len())).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("res").max_height(320.0).show(ui, |ui| {
+                    egui::Grid::new("res-grid").num_columns(4).striped(true).spacing(Vec2::new(10.0, 4.0)).show(ui, |ui| {
+                        for (id, title, path) in &files {
+                            ui.label(status(Some(PathBuf::from(path))));
+                            ui.label(title);
+                            ui.label(RichText::new(path).small().weak());
+                            ui.horizontal(|ui| {
+                                #[cfg(windows)]
+                                if ui.small_button("…").on_hover_text("Point to where it is now").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                        relink_one = Some((path.clone(), p.display().to_string()));
+                                    }
+                                }
+                                if ui.small_button("🗑").on_hover_text("Remove it from PianoCraft (the file itself is not touched)").clicked() {
+                                    remove_piece = Some(id.clone());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
             });
             ui.add_space(12.0);
             ui.heading("Make pages playable (Audiveris)");
@@ -1415,10 +1511,45 @@ impl App {
                 }
             });
         });
+        if let Some((old, new)) = relink_one {
+            let mut map = std::collections::HashMap::new();
+            map.insert(old, new);
+            self.relink_map(&map);
+        }
+        if let Some(id) = remove_piece {
+            self.piece_cache.borrow_mut().remove(&id);
+            self.progress.remove_piece(&id);
+            self.progress.book_links.retain(|_, v| *v != id);
+            for v in self.progress.page_conv.values_mut() {
+                v.retain(|x| *x != id);
+            }
+            self.progress.save();
+        }
         match action {
+            Some("check_files") => {
+                let mut all: Vec<PathBuf> = self.progress.books.values().map(PathBuf::from).collect();
+                all.extend(self.progress.library.iter().filter_map(|p| match &p.origin {
+                    Origin::Imported(o) => Some(PathBuf::from(o)),
+                    _ => None,
+                }));
+                let mut c = self.exists_cache.borrow_mut();
+                let mut missing = 0;
+                for p in all {
+                    let e = p.exists();
+                    missing += usize::from(!e);
+                    c.insert(p, e);
+                }
+                self.msg = if missing == 0 { "Everything is where it should be.".into() } else { format!("{missing} file(s) missing – relink them above, or use Relink everything if you moved your music.") };
+            }
             Some("rescan") => {
                 self.progress.save();
+                self.exists_cache.borrow_mut().clear();
                 self.rescan_pdfs();
+            }
+            Some("relink_all") => {
+                let root = PathBuf::from(self.relink_folder.trim().trim_matches('"'));
+                let (done, lost) = self.relink_all(&root, false);
+                self.msg = if lost == 0 { format!("Relinked {done} file(s) to {}.", root.display()) } else { format!("Relinked {done} file(s); {lost} still not found in {}.", root.display()) };
             }
             Some("convert_all") => {
                 let jobs = self.progress.pdf_index.iter().map(PathBuf::from).filter(|p| self.conv_redo || !self.converted_from(p)).map(|pdf| Job { pdf, pages: None }).collect();

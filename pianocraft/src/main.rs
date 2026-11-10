@@ -21,6 +21,13 @@ mod vecscore;
 mod tests;
 
 fn main() -> eframe::Result<()> {
+    // if PianoCraft ever crashes, say where in startup.log (in your PianoCraft data folder)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current().name().unwrap_or("?").to_string();
+        startlog::log(&format!("CRASH in thread {thread}: {info}"));
+        default_hook(info);
+    }));
     // `pianocraft --inspect file.mid` prints what the importer sees (handy for checking files)
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--inspect" {

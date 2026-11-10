@@ -25,6 +25,21 @@ pub enum Item {
     Find,
 }
 
+/// What the browser shows for one PDF – worked out once, not on every redraw.
+pub struct PdfInfo {
+    pub path: PathBuf,
+    pub title: String,
+    pub book: Option<BookId>,
+    pub folder: String,
+    pub sections: Vec<Section>,
+}
+
+pub struct PdfCache {
+    key: (usize, u64, usize, String),
+    pub list: Vec<PdfInfo>,
+    by_path: std::collections::HashMap<PathBuf, usize>,
+}
+
 pub fn page_key(pdf: &Path, page: usize) -> String {
     format!("{}#{}", pdf.display(), page)
 }
@@ -86,25 +101,84 @@ impl App {
         }
     }
 
-    fn all_pdfs(&self) -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = self.progress.pdf_index.iter().map(PathBuf::from).collect();
+    /// Every PDF with its title, folder and exercises – rebuilt only when the folders, the books or
+    /// the library change.
+    fn pdfs(&self) -> std::rc::Rc<PdfCache> {
+        let key = (self.progress.pdf_index.len(), self.progress.lib_gen.get(), self.progress.books.len(), self.progress.scan_folder.clone());
+        if let Some(c) = self.pdf_cache.borrow().as_ref() {
+            if c.key == key {
+                return c.clone();
+            }
+        }
+        let mut paths: Vec<PathBuf> = self.progress.pdf_index.iter().map(PathBuf::from).collect();
         for b in BookId::ALL {
             if let Some(p) = self.progress.book_path(b) {
-                if !v.contains(&p) {
-                    v.push(p);
+                if !paths.contains(&p) {
+                    paths.push(p);
                 }
             }
         }
-        v
+        let books: Vec<(BookId, PathBuf)> = BookId::ALL.iter().filter_map(|b| self.progress.book_path(*b).map(|p| (*b, p))).collect();
+        let roots: Vec<PathBuf> = self.progress.scan_folder.split(';').map(|f| PathBuf::from(f.trim().trim_matches('"'))).filter(|f| !f.as_os_str().is_empty()).collect();
+        // whole-PDF conversions by source file
+        let mut conv: std::collections::HashMap<&str, &Piece> = Default::default();
+        for p in &self.progress.library {
+            if let Origin::Imported(o) = &p.origin {
+                if p.id.starts_with("pdf-") && p.id == convert::piece_id(Path::new(o), None, 0) {
+                    conv.insert(o.as_str(), p);
+                }
+            }
+        }
+        let mut list = vec![];
+        for path in paths {
+            let book = books.iter().find(|(_, p)| *p == path).map(|(b, _)| *b);
+            let title = match book {
+                Some(b) => b.short().to_string(),
+                None => convert::nice_title(&path),
+            };
+            let parent = path.parent().unwrap_or(Path::new(""));
+            let folder = roots
+                .iter()
+                .filter_map(|r| parent.strip_prefix(r).ok().map(|rel| (r, rel)))
+                .map(|(r, rel)| {
+                    let root = r.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                    if rel.as_os_str().is_empty() { root } else { format!("{root} / {}", rel.display()) }
+                })
+                .next()
+                .unwrap_or_else(|| parent.file_name().and_then(|n| n.to_str()).unwrap_or("Other").to_string());
+            let sections = match conv.get(path.display().to_string().as_str()) {
+                Some(p) => {
+                    let s = p.src.as_ref().map(|s| s.sections.clone()).unwrap_or_default();
+                    if s.is_empty() {
+                        let page = p.src.as_ref().and_then(|s| s.bars.first()).map(|b| b.page).unwrap_or(1);
+                        vec![Section { beat: 0.0, end: p.end_beat(), page, title: p.title.clone() }]
+                    } else {
+                        s
+                    }
+                }
+                None => vec![],
+            };
+            list.push(PdfInfo { path, title, book, folder, sections });
+        }
+        list.sort_by(|a, b| a.folder.cmp(&b.folder).then(a.title.to_lowercase().cmp(&b.title.to_lowercase())));
+        let by_path = list.iter().enumerate().map(|(i, p)| (p.path.clone(), i)).collect();
+        let c = std::rc::Rc::new(PdfCache { key, list, by_path });
+        *self.pdf_cache.borrow_mut() = Some(c.clone());
+        c
     }
 
     fn book_of(&self, pdf: &Path) -> Option<BookId> {
-        BookId::ALL.iter().copied().find(|b| self.progress.book_path(*b).as_deref() == Some(pdf))
+        let c = self.pdfs();
+        match c.by_path.get(pdf) {
+            Some(&i) => c.list[i].book,
+            None => BookId::ALL.iter().copied().find(|b| self.progress.book_path(*b).as_deref() == Some(pdf)),
+        }
     }
 
     fn pdf_title(&self, pdf: &Path) -> String {
-        match self.book_of(pdf) {
-            Some(b) => b.short().to_string(),
+        let c = self.pdfs();
+        match c.by_path.get(pdf) {
+            Some(&i) => c.list[i].title.clone(),
             None => convert::nice_title(pdf),
         }
     }
@@ -116,22 +190,199 @@ impl App {
     }
 
     fn sections_of(&self, pdf: &Path) -> Vec<Section> {
-        match self.whole_piece(pdf) {
-            Some(p) => {
-                let s = p.src.as_ref().map(|s| s.sections.clone()).unwrap_or_default();
-                if s.is_empty() {
-                    let page = p.src.as_ref().and_then(|s| s.bars.first()).map(|b| b.page).unwrap_or(1);
-                    vec![Section { beat: 0.0, end: p.end_beat(), page, title: p.title.clone() }]
-                } else {
-                    s
+        let c = self.pdfs();
+        c.by_path.get(pdf).map(|&i| c.list[i].sections.clone()).unwrap_or_default()
+    }
+
+    /// Does this file exist? (asked once per file – disk checks on Google Drive are slow)
+    fn file_exists(&self, p: &Path) -> bool {
+        if let Some(e) = self.exists_cache.borrow().get(p) {
+            return *e;
+        }
+        let e = p.exists();
+        self.exists_cache.borrow_mut().insert(p.to_path_buf(), e);
+        e
+    }
+
+    pub(super) fn relink_map(&mut self, map: &std::collections::HashMap<String, String>) {
+        self.apply_relinks(map);
+    }
+
+    /// Check (really, on disk) that a file you're opening is there; if not, ask to relink it.
+    fn check_present(&mut self, p: &Path) -> bool {
+        self.exists_cache.borrow_mut().remove(p);
+        if self.file_exists(p) {
+            return true;
+        }
+        self.missing = Some(p.to_path_buf());
+        self.missing_edit.clear();
+        false
+    }
+
+    /// Point everything that used `old` at `new`: books, the PDF list, converted pieces, playable
+    /// pages and notes.
+    fn apply_relinks(&mut self, map: &std::collections::HashMap<String, String>) {
+        if map.is_empty() {
+            return;
+        }
+        let fix = |s: &mut String| {
+            if let Some(n) = map.get(s.as_str()) {
+                *s = n.clone();
+            }
+        };
+        for v in self.progress.books.values_mut() {
+            fix(v);
+        }
+        for v in self.progress.pdf_index.iter_mut() {
+            fix(v);
+        }
+        for p in self.progress.library.iter_mut() {
+            if let Origin::Imported(o) = &mut p.origin {
+                fix(o);
+            }
+            if let Some(src) = p.src.as_mut() {
+                fix(&mut src.pdf);
+            }
+        }
+        let old_keys: Vec<String> = self.progress.page_conv.keys().cloned().collect();
+        for k in old_keys {
+            if let Some((path, page)) = k.rsplit_once('#') {
+                if let Some(n) = map.get(path) {
+                    let v = self.progress.page_conv.remove(&k).unwrap_or_default();
+                    self.progress.page_conv.insert(format!("{n}#{page}"), v);
                 }
             }
-            None => vec![],
+        }
+        // notes are filed by file name, which a move keeps – nothing to do there
+        self.progress.library_changed();
+        self.progress.save();
+        self.exists_cache.borrow_mut().clear();
+        *self.pdf_cache.borrow_mut() = None;
+        if let Some(p) = self.bookview.path.clone() {
+            if let Some(n) = map.get(&p.display().to_string()) {
+                let page = self.bookview.page;
+                self.bookview.open(PathBuf::from(n), page);
+            }
         }
     }
 
+    /// Find every file PianoCraft knows about inside `root` (by file name) and relink it there.
+    /// `only_missing`: leave files that are still where they were. Returns (relinked, not found).
+    pub(super) fn relink_all(&mut self, root: &Path, only_missing: bool) -> (usize, usize) {
+        let mut by_name: std::collections::HashMap<String, PathBuf> = Default::default();
+        for f in scan(&root.to_path_buf()) {
+            if let Some(n) = f.file_name().and_then(|n| n.to_str()) {
+                by_name.entry(n.to_lowercase()).or_insert(f);
+            }
+        }
+        let mut known: Vec<String> = self.progress.books.values().cloned().collect();
+        known.extend(self.progress.pdf_index.iter().cloned());
+        for p in &self.progress.library {
+            if let Origin::Imported(o) = &p.origin {
+                known.push(o.clone());
+            }
+        }
+        known.sort();
+        known.dedup();
+        let mut map = std::collections::HashMap::new();
+        let mut lost = 0;
+        for old in known {
+            let op = Path::new(&old);
+            if only_missing && op.exists() {
+                continue;
+            }
+            let name = op.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+            match by_name.get(&name) {
+                Some(n) if n.as_path() != op => {
+                    map.insert(old.clone(), n.display().to_string());
+                }
+                Some(_) => {}
+                None => {
+                    if !op.exists() {
+                        lost += 1;
+                    }
+                }
+            }
+        }
+        let done = map.len();
+        self.apply_relinks(&map);
+        // music folders that no longer exist point at the new place
+        let folders: Vec<String> = self.progress.scan_folder.split(';').map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect();
+        if folders.iter().any(|f| !Path::new(f.trim_matches('"')).exists()) {
+            let mut kept: Vec<String> = folders.into_iter().filter(|f| Path::new(f.trim_matches('"')).exists()).collect();
+            kept.push(root.display().to_string());
+            self.progress.scan_folder = kept.join("; ");
+            self.progress.save();
+            self.rescan_pdfs();
+        }
+        (done, lost)
+    }
+
+    /// The window that appears when a file you open has moved.
+    pub(super) fn missing_dialog(&mut self, ctx: &egui::Context) {
+        let Some(old) = self.missing.clone() else { return };
+        let name = old.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let mut close = false;
+        let mut picked: Option<PathBuf> = None;
+        egui::Window::new("Can't find this file").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label(RichText::new(&name).strong());
+            ui.label(format!("It isn't at {} any more – it may have been moved, renamed or deleted, or the drive isn't connected.", old.display()));
+            ui.add_space(6.0);
+            #[cfg(windows)]
+            if ui.button("🔗 Find it…").clicked() {
+                picked = rfd::FileDialog::new().set_file_name(&name).add_filter("PDF", &["pdf"]).pick_file();
+            }
+            ui.horizontal(|ui| {
+                ui.label("or paste where it is now:");
+                ui.add(egui::TextEdit::singleline(&mut self.missing_edit).desired_width(360.0));
+                if ui.add_enabled(!self.missing_edit.trim().is_empty(), egui::Button::new("Use this")).clicked() {
+                    picked = Some(PathBuf::from(self.missing_edit.trim().trim_matches('"')));
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Moved all your music? Settings → Your loaded resources → Relink everything does every book at once.").small().weak());
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+        if let Some(newp) = picked {
+            if newp.exists() {
+                let mut map = std::collections::HashMap::new();
+                map.insert(old.display().to_string(), newp.display().to_string());
+                self.apply_relinks(&map);
+                // the others probably moved with it: look in the same folder (and below) for the rest
+                let mut extra = 0;
+                if let Some(dir) = newp.parent() {
+                    extra = self.relink_all(dir, true).0;
+                }
+                self.msg = if extra > 0 { format!("Relinked {name}, and {extra} other file(s) found in the same folder.") } else { format!("Relinked {name}.") };
+                self.missing = None;
+                if let Some(it) = self.missing_item.take() {
+                    let it = match it {
+                        Item::Page { pdf, page } if pdf == old => Item::Page { pdf: newp.clone(), page },
+                        Item::Section { pdf, idx } if pdf == old => Item::Section { pdf: newp.clone(), idx },
+                        other => other,
+                    };
+                    self.open_item(it);
+                }
+            } else {
+                self.msg = format!("There's no file at {}.", newp.display());
+            }
+        }
+        if close {
+            self.missing = None;
+            self.missing_item = None;
+        }
+    }
+
+    fn title_of(&self, id: &str) -> String {
+        self.builtins.iter().chain(self.progress.library.iter()).find(|p| p.id == id).map(|p| p.title.clone()).unwrap_or_default()
+    }
+
     fn section_piece(&self, pdf: &Path, idx: usize) -> Option<Piece> {
-        let whole = self.whole_piece(pdf)?;
+        let id = self.whole_piece(pdf)?.id.clone();
+        let whole = self.find_piece(&id)?;
+        let whole = &whole;
         let secs = self.sections_of(pdf);
         let sct = secs.get(idx)?;
         if secs.len() == 1 {
@@ -185,7 +436,22 @@ impl App {
         }
         self.tab = Tab::Main;
         self.bookview.highlight = None;
-        self.item = Some(item.clone());
+        let prev = self.item.replace(item.clone());
+        // the file behind it: checked once, now
+        let file: Option<PathBuf> = match &item {
+            Item::Page { pdf, .. } | Item::Section { pdf, .. } => Some(pdf.clone()),
+            Item::BookPiece(n) => books::piece_ref(*n).and_then(|(b, _)| self.progress.book_path(b)),
+            Item::Whole { id } => self.progress.library.iter().find(|p| &p.id == id).and_then(|p| p.src.as_ref()).map(|s| PathBuf::from(&s.pdf)).filter(|p| !p.as_os_str().is_empty()),
+            _ => None,
+        };
+        if let Some(f) = file {
+            if !self.check_present(&f) {
+                // ask to relink first; open it once it's found, stay where you were meanwhile
+                self.item = prev;
+                self.missing_item = Some(item);
+                return;
+            }
+        }
         match item {
             Item::Unit(i) => self.unit_sel = i.min(units().len() - 1),
             Item::BookPiece(n) => self.open_book_piece(n),
@@ -301,7 +567,7 @@ impl App {
             Item::BookPiece(n) => books::piece_ref(*n).map(|(_, r)| format!("{n}. {}", r.2)).unwrap_or_default(),
             Item::Page { page, .. } => format!("page {page}"),
             Item::Section { pdf, idx } => self.sections_of(pdf).get(*idx).map(|s| if s.title.is_empty() { format!("p.{}", s.page) } else { s.title.clone() }).unwrap_or_default(),
-            Item::Whole { id } => self.find_piece(id).map(|p| p.title).unwrap_or_default(),
+            Item::Whole { id } => self.title_of(id),
             Item::Tech(s) => s.title(),
             Item::Reading(l) => reading::LEVELS.get(*l as usize).map(|x| x.0.to_string()).unwrap_or_default(),
             Item::Find => "Find music".into(),
@@ -435,7 +701,8 @@ impl App {
         ui.add_space(4.0);
         let us = units();
         let filter = self.side_filter.trim().to_lowercase();
-        let pdfs = self.all_pdfs();
+        let cache = self.pdfs();
+        let pdfs: Vec<PathBuf> = cache.list.iter().map(|p| p.path.clone()).collect();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if !filter.is_empty() {
                 // one flat list of everything that matches
@@ -447,14 +714,13 @@ impl App {
                         go = Some(it);
                     }
                 }
-                for pdf in &pdfs {
-                    let t = self.pdf_title(pdf);
-                    if hit(&t) && ui.selectable_label(false, format!("📄 {t}")).clicked() {
-                        go = Some(Item::Page { pdf: pdf.clone(), page: 1 });
+                for info in &cache.list {
+                    if hit(&info.title) && ui.selectable_label(false, format!("📄 {}", info.title)).clicked() {
+                        go = Some(Item::Page { pdf: info.path.clone(), page: 1 });
                     }
-                    for (i, s) in self.sections_of(pdf).iter().enumerate() {
+                    for (i, s) in info.sections.iter().enumerate() {
                         if hit(&s.title) && ui.selectable_label(false, format!("    § {} (p.{})", s.title, s.page)).clicked() {
-                            go = Some(Item::Section { pdf: pdf.clone(), idx: i });
+                            go = Some(Item::Section { pdf: info.path.clone(), idx: i });
                         }
                     }
                 }
@@ -520,34 +786,22 @@ impl App {
                 if pdfs.is_empty() {
                     ui.label(RichText::new(if self.pdf_scan_rx.is_some() { "Looking through your folders…" } else { "No PDFs found yet – add your music folders in Settings." }).small().weak());
                 }
-                // group by folder
-                let roots: Vec<PathBuf> = self.progress.scan_folder.split(';').map(|f| PathBuf::from(f.trim().trim_matches('"'))).collect();
-                let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
-                for p in &pdfs {
-                    let parent = p.parent().unwrap_or(Path::new(""));
-                    let label = roots
-                        .iter()
-                        .filter_map(|r| parent.strip_prefix(r).ok().map(|rel| (r, rel)))
-                        .map(|(r, rel)| {
-                            let root = r.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                            if rel.as_os_str().is_empty() { root } else { format!("{root} / {}", rel.display()) }
-                        })
-                        .next()
-                        .unwrap_or_else(|| parent.file_name().and_then(|n| n.to_str()).unwrap_or("Other").to_string());
-                    groups.entry(label).or_default().push(p.clone());
-                }
                 let cur_pdf: Option<PathBuf> = match &cur {
                     Some(Item::Page { pdf, .. }) | Some(Item::Section { pdf, .. }) => Some(pdf.clone()),
                     _ => None,
                 };
-                for (folder, mut list) in groups {
-                    list.sort_by_key(|p| self.pdf_title(p).to_lowercase());
-                    let has_cur = cur_pdf.as_ref().is_some_and(|c| list.contains(c));
-                    egui::CollapsingHeader::new(format!("📁 {folder} ({})", list.len())).id_salt(("folder", &folder)).open(if has_cur { Some(true) } else { None }).show(ui, |ui| {
-                        for pdf in list {
-                            self.sidebar_pdf(ui, &pdf, &cur, &mut go);
+                // (the list is already sorted by folder, then title)
+                let mut i = 0;
+                while i < cache.list.len() {
+                    let folder = cache.list[i].folder.clone();
+                    let j = (i..cache.list.len()).find(|&k| cache.list[k].folder != folder).unwrap_or(cache.list.len());
+                    let has_cur = cur_pdf.as_ref().is_some_and(|c| cache.list[i..j].iter().any(|p| &p.path == c));
+                    egui::CollapsingHeader::new(format!("📁 {folder} ({})", j - i)).id_salt(("folder", &folder)).open(if has_cur { Some(true) } else { None }).show(ui, |ui| {
+                        for info in &cache.list[i..j] {
+                            self.sidebar_pdf(ui, info, &cur, &mut go);
                         }
                     });
+                    i = j;
                 }
             });
 
@@ -620,11 +874,12 @@ impl App {
     }
 
     /// One PDF in the browser: its pages and the exercises on them.
-    fn sidebar_pdf(&self, ui: &mut egui::Ui, pdf: &Path, cur: &Option<Item>, go: &mut Option<Item>) {
+    fn sidebar_pdf(&self, ui: &mut egui::Ui, info: &PdfInfo, cur: &Option<Item>, go: &mut Option<Item>) {
         let sel = |it: &Item| cur.as_ref() == Some(it);
-        let title = self.pdf_title(pdf);
-        let book = self.book_of(pdf);
-        let secs = self.sections_of(pdf);
+        let pdf = info.path.as_path();
+        let title = &info.title;
+        let book = info.book;
+        let secs = &info.sections;
         let here = matches!(cur, Some(Item::Page { pdf: p, .. }) | Some(Item::Section { pdf: p, .. }) if p == pdf);
         let mark = if !secs.is_empty() || matches!(book, Some(BookId::RussianSchool1a | BookId::RussianSchool1b)) { "🔊 " } else { "📄 " };
         egui::CollapsingHeader::new(format!("{mark}{title}")).id_salt(("pdf", pdf)).open(if here { Some(true) } else { None }).show(ui, |ui| {
@@ -782,7 +1037,7 @@ impl App {
                 ui.horizontal(|ui| {
                     match task {
                         Task::Tech { role, spec, original } => {
-                            let piece_id = generate(spec).id;
+                            let piece_id = spec.id();
                             let st = self.progress.pieces.get(&piece_id).cloned().unwrap_or_default();
                             ui.label(RichText::new(format!("🎹 {role}:")).weak());
                             ui.label(RichText::new(spec.title()).strong());
@@ -956,7 +1211,7 @@ impl App {
         // the book page beside the music, following it
         let src_pdf: Option<PathBuf> = {
             let c = self.cur.as_ref().unwrap();
-            c.base.src.as_ref().map(|s| PathBuf::from(&s.pdf)).filter(|p| !p.as_os_str().is_empty() && p.exists()).or_else(|| {
+            c.base.src.as_ref().map(|s| PathBuf::from(&s.pdf)).filter(|p| !p.as_os_str().is_empty() && self.file_exists(p)).or_else(|| {
                 c.book_piece.and_then(books::piece_ref).and_then(|(b, _)| self.progress.book_path(b))
             })
         };

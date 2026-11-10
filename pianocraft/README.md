@@ -65,7 +65,7 @@ Once connected, the keys you press light up green, and **Wait for me** pauses at
 If PianoCraft ever doesn't open, look at `%APPDATA%\\PianoCraft\\startup.log`: the last line shows how far it got. It only records step names and times, and never leaves your PC.
 
 ## Your data
-Progress, annotations (`progress.json`, `annotations.json`) and your converted and imported music (`library.json`) live in `%APPDATA%\PianoCraft\`.
+Progress and annotations (`progress.json`, `annotations.json`) and your converted and imported music (`library\`: a small index plus one file per piece, read only when you open it) live in `%APPDATA%\PianoCraft\`. If PianoCraft ever crashes, `startup.log` there says where.
 
 ## Building from source
 ```

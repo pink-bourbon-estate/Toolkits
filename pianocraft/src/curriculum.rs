@@ -113,6 +113,9 @@ pub struct Progress {
     pub library: Vec<Piece>,
     #[serde(skip)]
     pub library_dirty: std::cell::Cell<bool>,
+    /// Bumped whenever the library changes (so screens can cache what they show).
+    #[serde(skip)]
+    pub lib_gen: std::cell::Cell<u64>,
     #[serde(default)]
     pub scan_folder: String,
     #[serde(default)]
@@ -159,6 +162,29 @@ pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+fn lib_dir() -> PathBuf {
+    data_dir().join("library")
+}
+
+fn piece_file(id: &str) -> PathBuf {
+    let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(120).collect();
+    lib_dir().join(format!("{safe}.json"))
+}
+
+/// A piece without its notes, for the index: title, source, key, and the exercises inside it.
+fn light(p: &Piece) -> Piece {
+    let mut l = p.clone();
+    l.notes.clear();
+    if let Some(src) = l.src.as_mut() {
+        if src.sections.is_empty() {
+            let page = src.bars.first().map(|b| b.page).unwrap_or(1);
+            src.sections.push(crate::model::Section { beat: 0.0, end: p.end_beat(), page, title: p.title.clone() });
+        }
+        src.bars.clear();
+    }
+    l
+}
+
 pub fn data_dir() -> PathBuf {
     let d = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("PianoCraft");
     let _ = std::fs::create_dir_all(&d);
@@ -169,12 +195,23 @@ impl Progress {
     pub fn load() -> Progress {
         let p = data_dir().join("progress.json");
         let mut pr: Progress = std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let lib = data_dir().join("library.json");
-        match std::fs::read_to_string(&lib).ok().and_then(|s| serde_json::from_str::<Vec<Piece>>(&s).ok()) {
-            Some(l) => pr.library = l,
-            // first run of this version: move the library out of progress.json
-            None if !pr.library.is_empty() => pr.library_dirty.set(true),
-            None => {}
+        // The library is a small index (titles, sources, exercises); each piece's notes live in
+        // their own file and are read only when you open it.
+        match std::fs::read_to_string(lib_dir().join("index.json")).ok().and_then(|s| serde_json::from_str::<Vec<Piece>>(&s).ok()) {
+            Some(index) => pr.library = index,
+            None => {
+                // older versions: everything in one big library.json (or inside progress.json)
+                let old = data_dir().join("library.json");
+                let full: Vec<Piece> = std::fs::read_to_string(&old).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| std::mem::take(&mut pr.library));
+                pr.library = vec![];
+                let mut ok = true;
+                for p in full {
+                    ok &= pr.add_piece(p);
+                }
+                if ok && pr.save_index() {
+                    let _ = std::fs::remove_file(old);
+                }
+            }
         }
         if pr.course_v < 2 {
             // four chapters were added in front of the old first unit
@@ -183,19 +220,57 @@ impl Progress {
         }
         pr
     }
+    /// Add (or replace) a piece: its notes go to their own file, the index keeps the rest.
+    /// Returns false if the file couldn't be written.
+    pub fn add_piece(&mut self, p: Piece) -> bool {
+        let _ = std::fs::create_dir_all(lib_dir());
+        let ok = serde_json::to_string(&p).map(|s| std::fs::write(piece_file(&p.id), s).is_ok()).unwrap_or(false);
+        let l = light(&p);
+        self.library.retain(|x| x.id != l.id);
+        self.library.push(l);
+        self.library_changed();
+        ok
+    }
+
+    /// Read a piece's notes from disk. Where it came from is taken from the index (which is what
+    /// relinking updates).
+    pub fn load_piece(&self, id: &str) -> Option<Piece> {
+        let entry = self.library.iter().find(|p| p.id == id)?;
+        let mut p: Piece = std::fs::read_to_string(piece_file(id)).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+        p.origin = entry.origin.clone();
+        p.title = entry.title.clone();
+        if let (Some(src), Some(e)) = (p.src.as_mut(), entry.src.as_ref()) {
+            src.pdf = e.pdf.clone();
+        }
+        Some(p)
+    }
+
+    pub fn remove_piece(&mut self, id: &str) {
+        self.library.retain(|p| p.id != id);
+        let _ = std::fs::remove_file(piece_file(id));
+        self.library_changed();
+    }
+
+    fn save_index(&self) -> bool {
+        let _ = std::fs::create_dir_all(lib_dir());
+        let p = lib_dir().join("index.json");
+        match serde_json::to_string(&self.library) {
+            Ok(s) => {
+                let tmp = p.with_extension("json.tmp");
+                std::fs::write(&tmp, s).is_ok() && std::fs::rename(tmp, p).is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Call after changing `library`; it's written on the next save.
     pub fn library_changed(&self) {
         self.library_dirty.set(true);
+        self.lib_gen.set(self.lib_gen.get() + 1);
     }
     pub fn save(&self) {
-        if self.library_dirty.replace(false) {
-            let p = data_dir().join("library.json");
-            if let Ok(s) = serde_json::to_string(&self.library) {
-                let tmp = p.with_extension("json.tmp");
-                if std::fs::write(&tmp, s).is_ok() {
-                    let _ = std::fs::rename(tmp, p);
-                }
-            }
+        if self.library_dirty.replace(false) && !self.save_index() {
+            self.library_dirty.set(true);
         }
         let p = data_dir().join("progress.json");
         if let Ok(s) = serde_json::to_string_pretty(self) {
@@ -220,8 +295,10 @@ impl Progress {
     pub fn done(&self, id: &str) -> bool {
         self.pieces.get(id).is_some_and(|p| p.done) || self.ticks.contains_key(id)
     }
+    /// Where a book is. (Not checked on disk here: this is asked many times a second, and checking
+    /// a file on Google Drive is slow. Opening a missing file just shows an error on the page.)
     pub fn book_path(&self, b: BookId) -> Option<PathBuf> {
-        self.books.get(&b).map(PathBuf::from).filter(|p| p.exists())
+        self.books.get(&b).filter(|p| !p.trim().is_empty()).map(PathBuf::from)
     }
 }
 
