@@ -166,6 +166,8 @@ pub struct Glyph {
     /// Font size in page units (music fonts are drawn at 4 staff-spaces per em).
     pub size: f64,
     pub smufl: bool,
+    /// Part of a run of ordinary text (a title, lyrics, a direction) rather than music symbols.
+    pub text: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +290,16 @@ impl<'a> Device<'a> for Collector<'_> {
         if matches!(draw_mode, DrawMode::Invisible) {
             return;
         }
+        // A run that contains ordinary letters – ones no music font uses for a symbol – is text.
+        let uni = |g: &hayro::hayro_interpret::font::PositionedGlyph<'_>| match g.as_unicode() {
+            Some(hayro::hayro_interpret::hayro_cmap::BfString::Char(c)) => c,
+            Some(hayro::hayro_interpret::hayro_cmap::BfString::String(s)) => s.chars().next().unwrap_or('\0'),
+            None => char::from_u32(g.char_code()).unwrap_or('\0'),
+        };
+        let run_is_text = run.glyphs().iter().any(|g| {
+            let c = uni(g);
+            c.is_alphabetic() && !(0xE000..=0xF8FF).contains(&(c as u32)) && (!c.is_ascii() || !"wbnkjJrRcCBpfmszU".contains(c)) && mac_roman(c).and_then(sonata).is_none()
+        });
         for g in run.glyphs() {
             let t = props.transform * g.transform();
             let origin = t * Point::ZERO;
@@ -305,7 +317,8 @@ impl<'a> Device<'a> for Collector<'_> {
             } else {
                 (mac_roman(ch).and_then(sonata), false)
             };
-            self.m.glyphs.push(Glyph { sym, ch, x: origin.x, y: origin.y, size, smufl: sm });
+            let sym = if run_is_text { None } else { sym };
+            self.m.glyphs.push(Glyph { sym, ch, x: origin.x, y: origin.y, size, smufl: sm, text: run_is_text });
         }
     }
     fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {
@@ -331,9 +344,70 @@ pub fn extract(bytes: Vec<u8>) -> Result<Vec<PageMarks>, String> {
         // some programs draw the same symbol twice (e.g. arpeggio/cross-staff): keep one
         let mut seen = std::collections::HashSet::new();
         marks.glyphs.retain(|g| seen.insert((g.ch as u32, (g.x * 4.0).round() as i64, (g.y * 4.0).round() as i64)));
+        mark_text(&mut marks.glyphs);
         pages.push(marks);
     }
     Ok(pages)
+}
+
+/// Text is often drawn one character at a time, so group neighbouring glyphs of the same size on
+/// the same line into words: a group with any ordinary letter in it (one that no music font uses
+/// for a symbol) is text – a title, lyrics, a direction – not music.
+fn mark_text(gl: &mut [Glyph]) {
+    let clearly_text = |g: &Glyph| {
+        let c = g.ch;
+        !g.smufl && c.is_alphabetic() && !(0xE000..=0xF8FF).contains(&(c as u32)) && (!c.is_ascii() || !"wbnkjJrRcCBpfmszU".contains(c)) && mac_roman(c).and_then(sonata).is_none()
+    };
+    let n = gl.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| gl[*a].y.partial_cmp(&gl[*b].y).unwrap_or(std::cmp::Ordering::Equal));
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut i = i;
+        while p[i] != r {
+            let nx = p[i];
+            p[i] = r;
+            i = nx;
+        }
+        r
+    }
+    for oi in 0..n {
+        let i = order[oi];
+        if gl[i].smufl || gl[i].size <= 0.0 {
+            continue;
+        }
+        for &j in order.iter().skip(oi + 1) {
+            if gl[j].y - gl[i].y > gl[i].size * 0.3 {
+                break;
+            }
+            if gl[j].smufl {
+                continue;
+            }
+            let ratio = gl[i].size.max(gl[j].size) / gl[i].size.min(gl[j].size).max(0.01);
+            if ratio < 1.08 && (gl[i].x - gl[j].x).abs() < gl[i].size * 1.3 {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut texty = std::collections::HashSet::new();
+    for i in 0..n {
+        if clearly_text(&gl[i]) {
+            texty.insert(find(&mut parent, i));
+        }
+    }
+    for i in 0..n {
+        if texty.contains(&find(&mut parent, i)) {
+            gl[i].text = true;
+            gl[i].sym = None;
+        }
+    }
 }
 
 // ------------------------------------------------------------------ recognition
@@ -491,6 +565,8 @@ pub fn read_pdf_pages(bytes: Vec<u8>, title: &str, only: Option<(usize, usize)>)
     let mut first_key: Option<i32> = None;
     let mut first_ts: Option<(u32, u32)> = None;
     let mut key_changes: Vec<(f64, i32)> = vec![];
+    let mut bar_marks: Vec<crate::model::BarMark> = vec![];
+    let mut sections: Vec<crate::model::Section> = vec![];
 
     for (page_no, m) in pages.iter().enumerate() {
         if only.is_some_and(|(a, b)| page_no + 1 < a || page_no + 1 > b) {
@@ -537,7 +613,136 @@ pub fn read_pdf_pages(bytes: Vec<u8>, title: &str, only: Option<(usize, usize)>)
             best.filter(|_| bd < sp * 7.0)
         };
         let is_music = |g: &Glyph| (g.size - music_size).abs() < music_size * 0.2 || (g.sym.is_some() && g.smufl && g.size > music_size * 0.55);
-        for sys in &systems {
+        // ---- headings: text in the gap above a system starts a new exercise
+        // text = letters, digits and spaces outside the staves (a title can be as big as the music font)
+        let in_staff = |y: f64| staves.iter().any(|st| y > st.top() - sp * 1.5 && y < st.bottom() + sp * 1.5);
+        let is_text = |g: &Glyph| g.text && g.size < music_size * 2.5 && g.size > 3.0 && !in_staff(g.y);
+        let mut text_sizes: Vec<f64> = m.glyphs.iter().filter(|g| is_text(g) && g.ch.is_alphabetic()).map(|g| g.size).collect();
+        text_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let body_size = text_sizes.get(text_sizes.len() / 2).copied().unwrap_or(10.0);
+        let gaps: Vec<f64> = systems.windows(2).map(|w| staves[w[1][0]].top() - staves[*w[0].last().unwrap()].bottom()).collect();
+        let median_gap = {
+            let mut g = gaps.clone();
+            g.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            g.get(g.len() / 2).copied().unwrap_or(sp * 10.0)
+        };
+        let mut prev_bottom = 0.0f64;
+        for (sys_no, sys) in systems.iter().enumerate() {
+            let sys_top = staves[sys[0]].top();
+            let sys_bottom = staves[*sys.last().unwrap()].bottom();
+            let gap = sys_top - prev_bottom;
+            // (skip the band just under the previous system: pedal marks, 'legato', 'repeat twice'…)
+            let region = (prev_bottom + if sys_no == 0 { 0.0 } else { sp * 4.0 }, sys_top - sp * 1.2);
+            prev_bottom = sys_bottom;
+            {
+                // text lines in the gap, top to bottom
+                let mut gl: Vec<&Glyph> = m.glyphs.iter().filter(|g| is_text(g) && g.y > region.0 && g.y < region.1).collect();
+                let mut seen_pos = std::collections::HashSet::new();
+                gl.retain(|g| seen_pos.insert(((g.x * 2.0) as i64, (g.y * 2.0) as i64, g.ch)));
+                gl.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal).then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)));
+                let mut lines: Vec<(f64, f64, Vec<&Glyph>)> = vec![]; // y, size, glyphs
+                for g in gl {
+                    match lines.last_mut() {
+                        Some(l) if (l.0 - g.y).abs() < g.size * 0.4 => {
+                            l.1 = l.1.max(g.size);
+                            l.2.push(g)
+                        }
+                        _ => lines.push((g.y, g.size, vec![g])),
+                    }
+                }
+                let text_of = |gs: &[&Glyph]| -> String {
+                    let mut v: Vec<&&Glyph> = gs.iter().collect();
+                    v.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                    // use the PDF's own spaces when it has them; otherwise guess from wide gaps
+                    // the PDF's own spaces, plus a space wherever the gap between letters is much wider
+                    // than this line's usual letter spacing (or the type size jumps, as in "A  The …")
+                    let steps: Vec<f64> = v.windows(2).filter(|w| w[0].ch != ' ' && w[1].ch != ' ').map(|w| (w[1].x - w[0].x) / w[0].size.max(w[1].size)).collect();
+                    let mut st = steps.clone();
+                    st.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let usual = st.get(st.len() / 2).copied().unwrap_or(0.55);
+                    let mut out = String::new();
+                    let mut last: Option<&Glyph> = None;
+                    for g in v {
+                        if let Some(l) = last {
+                            let d = (g.x - l.x) / g.size.max(l.size);
+                            let jump = g.size.max(l.size) / g.size.min(l.size) > 1.5;
+                            let camel = l.ch.is_lowercase() && g.ch.is_uppercase();
+                            let inside_word = l.ch.is_uppercase() && g.ch.is_lowercase() && !jump;
+                            if (d > usual * 2.2 || jump || camel) && !inside_word && !out.ends_with(' ') && g.ch != ' ' {
+                                out.push(' ');
+                            }
+                        }
+                        if !(g.ch == ' ' && out.ends_with(' ')) {
+                            out.push(g.ch);
+                        }
+                        last = Some(g);
+                    }
+                    out.split_whitespace().collect::<Vec<_>>().join(" ")
+                };
+                // keep lines that read like headings (words, not a lone page number or lyric syllable),
+                // left of the right margin (composers and arrangers sit on the right)
+                let heads: Vec<(f64, String)> = lines
+                    .iter()
+                    .filter(|l| {
+                        let letters = l.2.iter().filter(|g| g.ch.is_ascii_alphabetic()).count();
+                        let word = text_of(&l.2).split(|c: char| !c.is_alphabetic()).any(|w| w.chars().count() >= 4);
+                        ((letters >= 3 && word) || (letters >= 1 && l.2.len() <= 3 && l.1 >= body_size * 1.4)) && l.2.iter().map(|g| g.x).fold(f64::MAX, f64::min) < m.width * 0.6
+                    })
+                    // lines in the top margin may be a running header: marked so they can be dropped
+                    // later if they repeat across the book
+                    .map(|l| (l.1, format!("{}{}", if l.0 < m.height * 0.09 { "\u{1}" } else { "" }, text_of(&l.2))))
+                    .filter(|h| h.1.trim_start_matches('\u{1}').len() > 0)
+                    .collect();
+                let big = heads.iter().any(|h| h.0 >= body_size * 1.1);
+                if std::env::var("VS_HEADS").is_ok() && !heads.is_empty() {
+                    eprintln!("p{} sys{} gap {:.0} med {:.0} body {:.1} big {} heads {:?}", page_no + 1, sys_no, gap, median_gap, body_size, big, heads);
+                }
+                // a numbered movement can follow a tempo mark on the same line ("♩ = 65  II: Lost Butterfly")
+                let heads: Vec<(f64, String)> = heads
+                    .into_iter()
+                    .map(|(sz, t)| {
+                        let mark = if t.starts_with('\u{1}') { "\u{1}" } else { "" };
+                        let body = t.trim_start_matches('\u{1}');
+                        let words: Vec<&str> = body.split_whitespace().collect();
+                        match words.iter().position(|w| w.len() >= 2 && w.trim_end_matches([':', '.']).chars().all(|c| "IVX".contains(c)) && w.ends_with([':', '.'])) {
+                            Some(i) if i > 0 => (sz, format!("{mark}{}", words[i..].join(" "))),
+                            _ => (sz, t),
+                        }
+                    })
+                    .collect();
+                // performance directions are not headings
+                const DIRECTIONS: [&str; 22] = ["rit", "rall", "poco", "tempo", "cresc", "dim", "accel", "molto", "piu", "più", "meno", "legat", "dolce", "espress", "rubato", "simile", "sempre", "ped", "pedal", "repeat", "arpeggiate", "fine"];
+                let heads: Vec<(f64, String)> = heads
+                    .into_iter()
+                    .filter(|h| {
+                        let t = h.1.to_lowercase();
+                        !t.split(|c: char| !c.is_alphabetic()).any(|w| DIRECTIONS.iter().any(|d| w.starts_with(d)))
+                    })
+                    .collect();
+                // "I: Sincerely", "II. Michishirube", "3. Right Hand Rising", "No. 4", "Exercise 2"…
+                let numbered = heads.iter().any(|h| {
+                    let t = h.1.trim_start_matches('\u{1}').trim();
+                    let first = t.split(|c: char| c == ' ' || c == ':' || c == '.').next().unwrap_or("");
+                    let roman = !first.is_empty() && first.chars().all(|c| "IVX".contains(c)) && t[first.len()..].starts_with([':', '.', ' ']);
+                    let num = !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()) && t[first.len()..].starts_with('.');
+                    let lower = t.to_lowercase();
+                    roman || num || lower.starts_with("no.") || lower.starts_with("exercise") || lower.starts_with("study") || lower.starts_with("etude")
+                });
+                let wordy = heads.iter().any(|h| h.1.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2).count() >= 2);
+                let new_section = !heads.is_empty()
+                    && (sections.is_empty() || big || numbered || (sys_no == 0 && wordy) || (sys_no > 0 && gap > median_gap * 1.35));
+                if new_section {
+                    // the lines nearest the music (at most three)
+                    let from = heads.len().saturating_sub(3);
+                    let mut title: Vec<String> = heads[from..].iter().map(|h| h.1.clone()).collect();
+                    title.dedup();
+                    let title = title.join(" · ");
+                    if let Some(last) = sections.last_mut() {
+                        last.end = t_global;
+                    }
+                    sections.push(crate::model::Section { beat: t_global, end: f64::MAX, page: (page_no + 1) as u32, title });
+                }
+            }
             report.systems += 1;
             // Piano music is a treble staff over a bass staff. With more staves, take the lowest
             // such pair (a vocal line sits on top) – unless the extra staves are below it
@@ -1062,6 +1267,17 @@ pub fn read_pdf_pages(bytes: Vec<u8>, title: &str, only: Option<(usize, usize)>)
                         report.notes += 1;
                     }
                 }
+                bar_marks.push(crate::model::BarMark {
+                    beat: t_global,
+                    page: (page_no + 1) as u32,
+                    rect: Some([
+                        (mx0.max(sys_x0) / m.width) as f32,
+                        ((staves[parts[0]].top() - sp * 2.5) / m.height) as f32,
+                        (mx1 / m.width) as f32,
+                        ((staves[parts[parts.len() - 1]].bottom() + sp * 2.5) / m.height) as f32,
+                    ]),
+                    ts,
+                });
                 t_global += m_len;
             }
         }
@@ -1115,6 +1331,43 @@ pub fn read_pdf_pages(bytes: Vec<u8>, title: &str, only: Option<(usize, usize)>)
         pickup: if pickup > 0.0 { pickup } else { 0.0 },
         notes,
         origin: Origin::BuiltIn,
+        src: {
+            if let Some(last) = sections.last_mut() {
+                last.end = t_global;
+            }
+            // Drop running headers (the same words on many pages) and page numbers from titles,
+            // then fold sections left without a heading into the one before.
+            // compare lines without their page numbers
+            let norm = |t: &str| t.trim_start_matches('\u{1}').split_whitespace().filter(|w| !w.chars().all(|c| c.is_ascii_digit())).collect::<Vec<_>>().join(" ").to_lowercase();
+            let mut counts: std::collections::HashMap<String, usize> = Default::default();
+            for sct in &sections {
+                let mut seen = std::collections::HashSet::new();
+                for part in sct.title.split(" · ") {
+                    let n = norm(part);
+                    if !n.is_empty() && seen.insert(n.clone()) {
+                        *counts.entry(n).or_default() += 1;
+                    }
+                }
+            }
+            let mut cleaned: Vec<crate::model::Section> = vec![];
+            for mut sct in sections {
+                let parts: Vec<&str> = sct.title.split(" · ").filter(|p| {
+                    let n = norm(p);
+                    n.chars().count() >= 1 && !(p.starts_with('\u{1}') && counts.get(&n).copied().unwrap_or(0) >= 3)
+                }).map(|p| p.trim_start_matches('\u{1}')).collect();
+                let parts: Vec<String> = parts.iter().map(|p| norm_keep_case(p)).filter(|p| !p.is_empty()).collect();
+                let title: String = parts.join(" · ").chars().take(70).collect();
+                match (title.is_empty(), cleaned.last_mut()) {
+                    (true, Some(prev)) => prev.end = sct.end,
+                    _ => {
+                        sct.title = title;
+                        cleaned.push(sct);
+                    }
+                }
+            }
+            let sections = cleaned;
+            Some(crate::model::SourceMap { pdf: String::new(), bars: bar_marks, sections })
+        },
         key_changes: {
             // keep real changes only (drop repeats and a "change" to the key already in force)
             let mut v: Vec<(f64, i32)> = vec![];
@@ -1233,6 +1486,15 @@ fn time_measure(events: &[Event], mids: &[f64], sp: f64, bar_len: f64, bar_x1: f
         }
     }
     (onset, vec![bar_len], all_matched)
+}
+
+/// A heading line without page numbers at either end.
+fn norm_keep_case(t: &str) -> String {
+    let w: Vec<&str> = t.split_whitespace().collect();
+    let is_num = |s: &&str| s.chars().all(|c| c.is_ascii_digit());
+    let a = w.iter().position(|x| !is_num(x)).unwrap_or(w.len());
+    let b = w.iter().rposition(|x| !is_num(x)).map(|i| i + 1).unwrap_or(a);
+    w[a..b.max(a)].join(" ")
 }
 
 /// Quick check: does this PDF contain typeset music (vector music-font glyphs)?

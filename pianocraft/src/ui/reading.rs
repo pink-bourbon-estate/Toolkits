@@ -54,6 +54,7 @@ pub fn question_piece(p: u8) -> Piece {
         notes: vec![Note::new(1.5, 1.0, p, hand, None)],
         origin: Origin::Generated,
         key_changes: vec![],
+        src: None,
     }
 }
 

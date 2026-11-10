@@ -28,7 +28,8 @@ pub struct Job {
 pub enum ConvMsg {
     /// Now working on job `index` (0-based).
     Working { index: usize, what: String },
-    Piece(Box<Piece>),
+    /// A finished piece, and the job (PDF and pages) it came from.
+    Piece(Box<Piece>, Job),
     /// A PDF that couldn't be converted, and why (in plain words).
     Skipped { pdf: PathBuf, why: String },
     Finished,
@@ -116,6 +117,9 @@ fn convert_one(job: &Job, audiveris: Option<&Path>, tx: &Sender<ConvMsg>, cancel
         Ok((mut p, r)) => {
             p.id = piece_id(&job.pdf, job.pages, 0);
             p.origin = Origin::Imported(job.pdf.display().to_string());
+            if let Some(src) = p.src.as_mut() {
+                src.pdf = job.pdf.display().to_string();
+            }
             let pct = 100.0 * r.clean_measures as f64 / r.measures.max(1) as f64;
             let check = if pct >= 95.0 {
                 "Every bar adds up.".to_string()
@@ -123,7 +127,7 @@ fn convert_one(job: &Job, audiveris: Option<&Path>, tx: &Sender<ConvMsg>, cancel
                 format!("{pct:.0}% of bars add up exactly; listen through and compare the rest with the page.")
             };
             p.notes_text = format!("{} {check}", p.notes_text);
-            let _ = tx.send(ConvMsg::Piece(Box::new(p)));
+            let _ = tx.send(ConvMsg::Piece(Box::new(p), job.clone()));
             Ok(1)
         }
         Err(e) if e == vecscore::NOT_TYPESET_SCAN => {
@@ -151,7 +155,13 @@ fn convert_one(job: &Job, audiveris: Option<&Path>, tx: &Sender<ConvMsg>, cancel
                         p.title = if files.len() > 1 { format!("{title} – part {}", k + 1) } else { title.clone() };
                         p.notes_text = "Recognised from your scanned book by Audiveris. Old scans can have mistakes – compare with the page.".into();
                         p.origin = Origin::Imported(job.pdf.display().to_string());
-                        let _ = tx.send(ConvMsg::Piece(Box::new(p)));
+                        let first_page = job.pages.map(|r| r.0 as u32).unwrap_or(1);
+                        p.src = Some(crate::model::SourceMap {
+                            pdf: job.pdf.display().to_string(),
+                            bars: vec![crate::model::BarMark { beat: 0.0, page: first_page, rect: None, ts: (p.ts_num, p.ts_den) }],
+                            sections: vec![],
+                        });
+                        let _ = tx.send(ConvMsg::Piece(Box::new(p), job.clone()));
                         n += 1;
                     }
                     Ok(_) => {}

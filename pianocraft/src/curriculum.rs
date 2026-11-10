@@ -119,6 +119,15 @@ pub struct Progress {
     pub midi_port: Option<String>,
     #[serde(default)]
     pub unit_override: Option<usize>,
+    /// Course layout version (2 = starts at 1a chapter I; earlier versions started at chapter V).
+    #[serde(default)]
+    pub course_v: u32,
+    /// "pdf path#page" -> ids of the pieces converted from that page, in order.
+    #[serde(default)]
+    pub page_conv: HashMap<String, Vec<String>>,
+    /// Extra music folders (besides `scan_folder`), and PDFs found in them last time.
+    #[serde(default)]
+    pub pdf_index: Vec<String>,
     /// Where your books are.
     #[serde(default)]
     pub books: HashMap<BookId, String>,
@@ -166,6 +175,11 @@ impl Progress {
             // first run of this version: move the library out of progress.json
             None if !pr.library.is_empty() => pr.library_dirty.set(true),
             None => {}
+        }
+        if pr.course_v < 2 {
+            // four chapters were added in front of the old first unit
+            pr.unit_override = pr.unit_override.map(|u| u + 4);
+            pr.course_v = 2;
         }
         pr
     }
@@ -259,7 +273,58 @@ pub fn units() -> Vec<Unit> {
     use ScaleType as S;
     vec![
         Unit {
-            title: "1. Quavers (eighth notes)",
+            title: "Singing by ear, the keyboard, notes",
+            book: BookId::RussianSchool1a, page: 8,
+            pieces: (1..=14).collect(),
+            russian: "Sing each tune first, then pick it out on the piano with one finger (2, 3 or 4), each hand in turn. Learn the names of the keys, crotchets, minims and semibreves, and where the notes sit on the stave.",
+            nahre: "Find your landmarks first (Elements, ch.2): middle C, treble G and bass F. Read every other note as a step or skip from the nearest one.",
+            tasks: vec![
+                Task::Tech { role: "Warm-up", spec: t(X::FiveFinger, S::Major, C, 1, P::Straight, M::RightOnly, R::Quarters), original: None },
+                Task::Tech { role: "Rhythm", spec: TechSpec { seed: 1, ..t(X::Rhythm, S::Major, C, 1, P::Straight, M::RightOnly, R::Quarters) }, original: None },
+                Task::Theory { id: "th-0a", book: BookId::ElementsOfMusic, page: 16, title: "Landmark notes (Elements pp. 16–20)", what: "Read it, then do the note-reading trainer (Landmarks) until you get 20 in a row.", reading: Some(0) },
+                Task::Ear { id: "ear-0a", title: "Pick it out", what: "Sing no. 1 'Tra-la-la', then find it on the piano with your 3rd finger. Then start it on a different key." },
+            ],
+        },
+        Unit {
+            title: "Different fingers (non legato)",
+            book: BookId::RussianSchool1a, page: 15,
+            pieces: (15..=24).collect(),
+            russian: "Now each finger gets a turn. Play detached, with a loose arm and a round hand, the weight of the arm dropping into each key.",
+            nahre: "Relaxed and steady before fast (Elements, ch.3): count out loud and feel the beat in your body before you play.",
+            tasks: vec![
+                Task::Tech { role: "Warm-up", spec: t(X::FiveFinger, S::Major, C, 1, P::Straight, M::Parallel, R::Quarters), original: None },
+                Task::Tech { role: "Other keys", spec: t(X::FiveFinger, S::Major, G, 1, P::Straight, M::Parallel, R::Quarters), original: None },
+                Task::Tech { role: "Rhythm", spec: TechSpec { seed: 2, ..t(X::Rhythm, S::Major, C, 1, P::Straight, M::RightOnly, R::Quarters) }, original: None },
+                Task::Ear { id: "ear-0b", title: "Somewhere else", what: "No. 22 'Exercise' says: start it on D, E, F and A too. Do that by ear, without writing anything down." },
+            ],
+        },
+        Unit {
+            title: "Sharps, flats and naturals",
+            book: BookId::RussianSchool1a, page: 18,
+            pieces: (25..=31).collect(),
+            russian: "A sharp raises a note a semitone, a flat lowers it, a natural cancels them. Accidentals last for the rest of the bar; the key signature lasts for the whole piece.",
+            nahre: "Hear the half step: play E–F and B–C, the white-key semitones, then make the same sound on black keys.",
+            tasks: vec![
+                Task::Tech { role: "Warm-up", spec: t(X::FiveFinger, S::Major, D, 1, P::Straight, M::Parallel, R::Quarters), original: None },
+                Task::Tech { role: "Minor", spec: t(X::FiveFinger, S::NaturalMinor, A, 1, P::Straight, M::Parallel, R::Quarters), original: None },
+                Task::Ear { id: "ear-0c", title: "Major or minor?", what: "Play a five-finger pattern from C, then from C with E♭. Sing both. Which sounds happy, which sad?" },
+            ],
+        },
+        Unit {
+            title: "Smooth playing (legato)",
+            book: BookId::RussianSchool1a, page: 20,
+            pieces: (32..=45).collect(),
+            russian: "Join the notes: one finger lets go exactly as the next one plays. Listen for the overlap – no gaps, no smudges – and let the wrist follow the phrase.",
+            nahre: "Shape the line: every phrase rises and falls like a breath. Sing it, and play it the way you sang it.",
+            tasks: vec![
+                Task::Tech { role: "Warm-up", spec: TechSpec { accent: Accent::Swell, ..t(X::FiveFinger, S::Major, C, 1, P::Straight, M::Parallel, R::Quarters) }, original: None },
+                Task::Tech { role: "Contrary", spec: t(X::FiveFinger, S::Major, C, 1, P::Straight, M::Contrary, R::Quarters), original: None },
+                Task::Theory { id: "th-0d", book: BookId::ElementsOfMusic, page: 59, title: "What makes a melody? (Elements pp. 59–61)", what: "Then mark the phrases of no. 34 'Latvian Folk Song' with the pen in the book view.", reading: None },
+                Task::Ear { id: "ear-0d", title: "Legato by ear", what: "Sing no. 40 'Byelorussian Folk Song', then play it legato in C and in G." },
+            ],
+        },
+        Unit {
+            title: "Quavers (eighth notes)",
             book: BookId::RussianSchool1a, page: 24,
             pieces: (46..=58).collect(),
             russian: "Two quavers fit in one beat. Count out loud – \"one-and-two-and\" – and sing the folk songs before you play them.",
@@ -273,7 +338,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "2. The bass clef",
+            title: "The bass clef",
             book: BookId::RussianSchool1a, page: 30,
             pieces: (59..=67).collect(),
             russian: "The left hand gets its own melodies. Read the bass clef without converting from treble.",
@@ -287,7 +352,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "3. Dotted rhythms",
+            title: "Dotted rhythms",
             book: BookId::RussianSchool1a, page: 32,
             pieces: (68..=72).collect(),
             russian: "A dot adds half the note's value. Count the dot – don't guess it.",
@@ -301,7 +366,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "4. Anacrusis (pick-up notes)",
+            title: "Anacrusis (pick-up notes)",
             book: BookId::RussianSchool1a, page: 34,
             pieces: (73..=77).collect(),
             russian: "A piece can start before beat one. Breathe before the pick-up; it leads into the strong beat.",
@@ -315,7 +380,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "5. Semiquavers (sixteenth notes)",
+            title: "Semiquavers (sixteenth notes)",
             book: BookId::RussianSchool1a, page: 36,
             pieces: (78..=89).collect(),
             russian: "Four even semiquavers to a beat from loose fingers. Make triplet-sequence exercises from each scale you know.",
@@ -331,7 +396,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "6. Dynamics and phrasing",
+            title: "Dynamics and phrasing",
             book: BookId::RussianSchool1b, page: 8,
             pieces: (90..=99).collect(),
             russian: "Crescendo, diminuendo, the pause (fermata). In duets one person plays the tune, the other the accompaniment – swap roles.",
@@ -346,7 +411,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "7. Grace notes and double notes",
+            title: "Grace notes and double notes",
             book: BookId::RussianSchool1b, page: 13,
             pieces: (100..=109).collect(),
             russian: "Grace notes go just before the beat (no. 103). Double notes need a level hand and both notes exactly together (Gnesina studies 107–108).",
@@ -361,7 +426,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "8. Studies and chords",
+            title: "Studies and chords",
             book: BookId::RussianSchool1b, page: 17,
             pieces: (110..=119).collect(),
             russian: "Chords: lower the hand softly into the keys, 'to the bottom of the key', never throw it.",
@@ -376,7 +441,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "9. Dances",
+            title: "Dances",
             book: BookId::RussianSchool1b, page: 22,
             pieces: (120..=129).collect(),
             russian: "Each dance has its character: Telemann's Gavotte (122), the Valse (123), Papageno (126). Two-octave scales hands together.",
@@ -391,7 +456,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "10. Triplets and modes",
+            title: "Triplets and modes",
             book: BookId::RussianSchool1b, page: 28,
             pieces: (130..=139).collect(),
             russian: "A triplet: three equal notes in one beat (no. 133). Bartók's 'Song' (137) uses a mode – that's what gives it its colour.",
@@ -406,7 +471,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "11. Two voices – Baroque",
+            title: "Two voices – Baroque",
             book: BookId::RussianSchool1b, page: 34,
             pieces: (140..=149).collect(),
             russian: "Polyphony: each hand is its own singer. Silent finger change (no. 142). Minuet (L. Mozart), Bourrée (Krieger).",
@@ -421,7 +486,7 @@ pub fn units() -> Vec<Unit> {
             ],
         },
         Unit {
-            title: "12. Character pieces",
+            title: "Character pieces",
             book: BookId::RussianSchool1b, page: 44,
             pieces: (150..=163).collect(),
             russian: "Contrast and character: polka, march, mazurka, cradle song. Make each sound like what it is.",

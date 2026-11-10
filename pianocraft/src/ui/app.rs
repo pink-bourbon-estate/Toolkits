@@ -3,13 +3,13 @@ use crate::books::{self, BookId};
 use crate::builtin;
 use crate::curriculum::{self, apply_feedback, book_piece_id, current_unit, ladder, units, Feedback, PieceProgress, Progress, Rung, Task};
 use crate::generate::*;
-use crate::import::{import_file, import_musicxml};
+use crate::import::import_file;
 use crate::midi_in::MidiIn;
 use crate::model::{key_name, transpose_key, Hand, Note, Origin, Piece};
 use crate::transform::{arrange, easiest_transposition, rate, Arrangement, LhMode, RhMode};
 use crate::ui::falling::{falling_notes, keyboard, FallingOpts, KeyNames, KeyView, KeyboardOpts, KEYBOARDS, LH_COLOR, RH_COLOR};
 use crate::ui::convert::{self, ConvMsg, Converter, Job};
-use crate::ui::pdfview::{convert_page, find_audiveris, BookView, OmrMsg};
+use crate::ui::pdfview::{find_audiveris, BookView};
 use crate::ui::reading::{self, Trainer};
 use crate::ui::staff::{staff, StaffOpts};
 use egui::{Align, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, Vec2};
@@ -20,15 +20,13 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod workspace;
+use workspace::Item;
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
-    Today,
-    Practice,
-    Book,
-    Library,
-    Technique,
-    Reading,
-    Find,
+    /// Everything you practise: the browser on the left, the player on the right.
+    Main,
     Settings,
 }
 
@@ -63,12 +61,6 @@ struct BookOnly {
     reps_target: u32,
 }
 
-struct PendingLink {
-    page: usize,
-    book: BookId,
-    parts: Vec<(String, String)>, // (library id, description)
-    choice: Vec<Option<u32>>,
-}
 
 pub struct App {
     audio: Audio,
@@ -91,8 +83,6 @@ pub struct App {
     volume: f32,
     msg: String,
     plan_msg: String,
-    import_path: String,
-    scan_results: Vec<PathBuf>,
     search_text: String,
     tech: TechSpec,
     last_frame: Instant,
@@ -103,22 +93,28 @@ pub struct App {
     bookview: BookView,
     show_book_beside: bool,
     current_book: Option<BookId>,
-    omr_rx: Option<Receiver<OmrMsg>>,
-    omr_status: String,
     conv: Option<Converter>,
+    /// What's open: a course unit, a book page, an exercise, a technique drill…
+    item: Option<Item>,
+    side_open: bool,
+    side_filter: String,
+    pdf_scan_rx: Option<Receiver<Vec<String>>>,
+    last_sync_pos: f64,
+    /// The book piece waiting for its page to be converted.
+    conv_target: Option<u32>,
+    /// Pages Audiveris couldn't read this session (so they aren't retried automatically).
+    page_failed: HashSet<String>,
+    tech_mode: bool,
     /// Folder conversions: also send scanned books to Audiveris (slow).
     conv_scans: bool,
     /// Convert again even if a PDF is already in the Library.
     conv_redo: bool,
     /// Open the result when this single-page conversion finishes.
     conv_open: bool,
-    scanned_once: bool,
-    pending_link: Option<PendingLink>,
     trainer: Trainer,
     prev_pressed: HashSet<u8>,
     peek: bool,
     metro_only: bool,
-    lib_filter: u8,
     update: Option<crate::updater::Release>,
     update_rx: Option<Receiver<(bool, Result<Option<crate::updater::Release>, String>)>>,
     install_rx: Option<Receiver<Result<PathBuf, String>>>,
@@ -183,7 +179,7 @@ impl App {
             midi_ports,
             progress,
             builtins: { let mut v = builtin::all(); v.extend(crate::repertoire::pieces()); v },
-            tab: Tab::Today,
+            tab: Tab::Main,
             cur: None,
             book_only: None,
             view: View::Both,
@@ -198,8 +194,6 @@ impl App {
             volume: 0.7,
             msg: String::new(),
             plan_msg: String::new(),
-            import_path: String::new(),
-            scan_results: Vec::new(),
             search_text: String::new(),
             tech: TechSpec::default(),
             last_frame: Instant::now(),
@@ -210,19 +204,22 @@ impl App {
             bookview: BookView::new(),
             show_book_beside: true,
             current_book: None,
-            omr_rx: None,
-            omr_status: String::new(),
             conv: None,
+            item: None,
+            side_open: true,
+            side_filter: String::new(),
+            pdf_scan_rx: None,
+            last_sync_pos: -1.0,
+            conv_target: None,
+            page_failed: HashSet::new(),
+            tech_mode: false,
             conv_scans: false,
             conv_redo: false,
             conv_open: false,
-            scanned_once: false,
-            pending_link: None,
             trainer: Trainer::new(0),
             prev_pressed: HashSet::new(),
             peek: false,
             metro_only: false,
-            lib_filter: 0,
             update: None,
             update_rx: None,
             install_rx: None,
@@ -232,6 +229,8 @@ impl App {
             app.check_updates(false);
         }
         crate::startlog::log("window ready");
+        app.item = Some(Item::Unit(app.unit_sel));
+        app.rescan_pdfs();
         app.dev_hooks();
         app.audio.send(Cmd::Volume(app.volume));
         app.audio.send(Cmd::CountIn(app.count_in));
@@ -249,12 +248,20 @@ impl App {
             }
         }
         if let Ok(n) = std::env::var("PIANOCRAFT_BOOKPIECE").map(|s| s.parse::<u32>().unwrap_or(46)) {
-            self.open_book_piece(n);
+            self.open_item(Item::BookPiece(n));
+        }
+        if let Ok(v) = std::env::var("PIANOCRAFT_PDF") {
+            // path|page
+            let (p, pg) = v.rsplit_once('|').unwrap_or((&v, "1"));
+            self.open_item(Item::Page { pdf: PathBuf::from(p), page: pg.parse().unwrap_or(1) });
+        }
+        if let Ok(v) = std::env::var("PIANOCRAFT_SECTION") {
+            let (p, i) = v.rsplit_once('|').unwrap_or((&v, "0"));
+            self.open_item(Item::Section { pdf: PathBuf::from(p), idx: i.parse().unwrap_or(0) });
         }
         if std::env::var("PIANOCRAFT_TECH").is_ok() {
-            self.tech = TechSpec { ex: Exercise::Scale, scale: ScaleType::Dorian, tonic: 2, octaves: 2, pattern: Pattern::Circling, motion: Motion::Parallel, rhythm: Rhythm::Eighths, cycle: Cycle::WholeTones, ..TechSpec::default() };
-            let p = generate(&self.tech);
-            self.open_piece(p, true, None);
+            let spec = TechSpec { ex: Exercise::Scale, scale: ScaleType::Dorian, tonic: 2, octaves: 2, pattern: Pattern::Circling, motion: Motion::Parallel, rhythm: Rhythm::Eighths, cycle: Cycle::WholeTones, ..TechSpec::default() };
+            self.open_item(Item::Tech(spec));
         }
         if let Ok(l) = std::env::var("PIANOCRAFT_LEVEL").map(|s| s.parse::<usize>().unwrap_or(7)) {
             if let Some(c) = self.cur.as_mut() {
@@ -264,26 +271,19 @@ impl App {
             }
             self.reload();
         }
-        if let Ok(f) = std::env::var("PIANOCRAFT_LIBFILTER").map(|s| s.parse::<u8>().unwrap_or(0)) {
-            self.lib_filter = f;
-        }
         if std::env::var("PIANOCRAFT_PLAY").is_ok() {
             self.audio.send(Cmd::Play);
         }
         if let Ok(t) = std::env::var("PIANOCRAFT_TAB") {
-            self.tab = match t.as_str() {
-                "library" => Tab::Library,
-                "technique" => Tab::Technique,
-                "find" => Tab::Find,
-                "settings" => Tab::Settings,
-                "practice" => Tab::Practice,
-                "book" => Tab::Book,
-                "reading" => Tab::Reading,
-                _ => Tab::Today,
-            };
+            match t.as_str() {
+                "settings" => self.tab = Tab::Settings,
+                "reading" => self.open_item(Item::Reading(0)),
+                "find" => self.open_item(Item::Find),
+                _ => {}
+            }
         }
         if let Ok(u) = std::env::var("PIANOCRAFT_UNIT").map(|s| s.parse::<usize>().unwrap_or(0)) {
-            self.unit_sel = u;
+            self.open_item(Item::Unit(u));
         }
     }
 
@@ -392,33 +392,10 @@ impl App {
             }
         }
         self.apply_rung(&pp);
-        self.tab = Tab::Practice;
+        self.tab = Tab::Main;
         self.finished_prompt = false;
-    }
-
-    /// Open a Russian School piece: playable version if converted, otherwise practise from the page.
-    fn open_book_piece(&mut self, n: u32) {
-        self.audio.send(Cmd::Pause);
-        if let Some(id) = self.progress.book_links.get(&n).cloned() {
-            if let Some(p) = self.find_piece(&id) {
-                self.open_piece(p, false, Some(n));
-                return;
-            }
-        }
-        let Some((b, r)) = books::piece_ref(n) else { return };
-        if let Some(path) = self.progress.book_path(b) {
-            self.bookview.open(path, r.1);
-        }
-        self.current_book = Some(b);
-        // a dummy two-handed piece gives the full Russian-school ladder
-        let dummy = Piece {
-            notes: vec![Note::new(0.0, 1.0, 60, Hand::Right, None), Note::new(0.0, 1.0, 48, Hand::Left, None)],
-            ..reading::question_piece(60)
-        };
-        self.cur = None;
-        self.book_only = Some(BookOnly { number: n, rungs: ladder(&dummy, false), bpm: 72.0, beats: 4, reps_done: 0, reps_target: 3 });
-        self.plan_msg.clear();
-        self.tab = Tab::Practice;
+        self.tech_mode = false;
+        self.last_sync_pos = -1.0;
     }
 
     fn apply_rung(&mut self, pp: &PieceProgress) {
@@ -519,11 +496,17 @@ impl App {
     }
 
     fn import_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut last = None;
         for path in paths {
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+                self.open_item(Item::Page { pdf: path.clone(), page: 1 });
+                continue;
+            }
             match import_file(&path) {
                 Ok(p) => {
                     let d = rate(&p);
-                    self.msg = format!("Imported '{}' – difficulty {:.1}/10. Find it in the Library.", p.title, d.score);
+                    last = Some(p.id.clone());
+                    self.msg = format!("Imported '{}' – difficulty {:.1}/10. It's under 'Your files' on the left.", p.title, d.score);
                     self.progress.library.retain(|x| x.id != p.id);
                     self.progress.library.push(p);
                     self.progress.library_changed();
@@ -532,26 +515,16 @@ impl App {
                 Err(e) => self.msg = format!("{}: {e}", path.display()),
             }
         }
+        if let Some(id) = last {
+            self.open_item(Item::Whole { id });
+        }
     }
 
+    /// Make one page playable (typeset: instant; scanned: Audiveris in the background).
     fn start_omr(&mut self, book: Option<BookId>, pdf: PathBuf, page: usize) {
         self.current_book = book.or(self.current_book);
-        // The Russian School books are scans whose pieces get linked to the course, so they keep
-        // the page-by-page Audiveris route. Everything else goes through the converter, which reads
-        // typeset PDFs itself in a second and only uses Audiveris for scans.
-        if !matches!(book, Some(BookId::RussianSchool1a | BookId::RussianSchool1b)) {
-            self.conv_open = true;
-            self.start_convert(vec![Job { pdf, pages: Some((page, page)) }], true);
-            return;
-        }
-        let Some(exe) = find_audiveris(&self.progress.audiveris) else {
-            self.msg = format!("Audiveris isn't installed yet. It's free: download the Windows installer from {AUDIVERIS_URL}, install it, then press this button again. (Settings → Make pages playable has details.)");
-            self.tab = Tab::Settings;
-            return;
-        };
-        self.omr_status = format!("Reading page {page} with Audiveris… this takes about a minute.");
-        self.omr_rx = Some(convert_page(exe, pdf, page));
-        self.current_book = book.or(self.current_book);
+        self.conv_open = true;
+        self.start_convert(vec![Job { pdf, pages: Some((page, page)) }], true);
     }
 
     /// Convert PDFs in the background. `scans`: send scanned books to Audiveris if installed.
@@ -584,14 +557,34 @@ impl App {
                     c.index = index;
                     c.what = what;
                 }
-                ConvMsg::Piece(p) => {
+                ConvMsg::Piece(p, job) => {
                     c.made += 1;
                     self.progress.library.retain(|x| x.id != p.id);
+                    if let Some((a, b)) = job.pages {
+                        if a == b {
+                            let key = workspace::page_key(&job.pdf, a);
+                            let ids = self.progress.page_conv.entry(key).or_default();
+                            if !ids.contains(&p.id) {
+                                ids.push(p.id.clone());
+                            }
+                        }
+                    }
                     last_piece = Some((*p).clone());
                     self.progress.library.push(*p);
                     changed = true;
                 }
-                ConvMsg::Skipped { pdf, why } => c.skipped.push((pdf, why)),
+                ConvMsg::Skipped { pdf, why } => {
+                    if c.total == 1 {
+                        if let Some(Item::BookPiece(n)) = &self.item {
+                            if let Some((b, r)) = books::piece_ref(*n) {
+                                if self.progress.book_path(b).as_deref() == Some(pdf.as_path()) {
+                                    self.page_failed.insert(workspace::page_key(&pdf, r.1));
+                                }
+                            }
+                        }
+                    }
+                    c.skipped.push((pdf, why))
+                }
                 ConvMsg::Finished => {
                     c.finished = true;
                     changed = true;
@@ -621,70 +614,19 @@ impl App {
             }
             if self.conv_open {
                 self.conv_open = false;
-                if let Some(p) = last_piece {
-                    let note = p.notes_text.clone();
-                    self.open_piece(p, false, None);
-                    self.tab = Tab::Practice;
-                    self.msg = note;
-                }
-            }
-        }
-    }
-
-    fn poll_omr(&mut self) {
-        let Some(rx) = &self.omr_rx else { return };
-        let Ok(m) = rx.try_recv() else { return };
-        self.omr_rx = None;
-        match m {
-            OmrMsg::Failed { msg } => self.omr_status = msg,
-            OmrMsg::Done { pdf, page, files } => {
-                let book = BookId::ALL.iter().copied().find(|b| self.progress.book_path(*b).as_deref() == Some(pdf.as_path()));
-                let label = book.map(|b| b.short().to_string()).unwrap_or_else(|| pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("PDF").to_string());
-                let mut parts = vec![];
-                for (k, f) in files.iter().enumerate() {
-                    let xml = if f.extension().is_some_and(|x| x == "mxl") {
-                        std::fs::read(f).ok().and_then(|b| crate::import::unzip_for_omr(&b).ok())
-                    } else {
-                        std::fs::read_to_string(f).ok()
-                    };
-                    let Some(xml) = xml else { continue };
-                    if let Ok(mut p) = import_musicxml(&xml, "x") {
-                        p.id = format!("omr-{}-p{page}-{k}", label.to_lowercase().replace(' ', "-"));
-                        p.title = format!("{label} p.{page} – part {}", k + 1);
-                        p.notes_text = "Converted from your book page by Audiveris. Compare with the page – fix-ups may be needed.".into();
-                        p.origin = Origin::Imported(pdf.display().to_string());
-                        if !p.notes.is_empty() {
-                            let first: Vec<String> = p.notes.iter().filter(|n| n.hand == Hand::Right).take(5).map(|n| crate::model::pitch_name(n.pitch, p.key_fifths < 0)).collect();
-                            parts.push((p.id.clone(), format!("{} bars, starts {}", p.bar_count(), first.join(" "))));
-                            self.progress.library.retain(|x| x.id != p.id);
-                            self.progress.library.push(p);
-                            self.progress.library_changed();
+                // a book piece waiting for its page: open the playable version now
+                match (self.conv_target.take(), self.item.clone()) {
+                    (Some(n), Some(Item::BookPiece(m))) if n == m && made > 0 => self.open_item(Item::BookPiece(n)),
+                    (Some(_), _) => {}
+                    (None, Some(it @ Item::Section { .. })) if made > 0 => self.open_item(it),
+                    (None, _) => {
+                        if let Some(p) = last_piece {
+                            let note = p.notes_text.clone();
+                            self.open_item(Item::Whole { id: p.id.clone() });
+                            self.msg = note;
                         }
                     }
                 }
-                if parts.is_empty() {
-                    self.omr_status = "Audiveris finished but found no notes on that page.".into();
-                    return;
-                }
-                // link to the numbered pieces on that page
-                let on_page: Vec<u32> = match book {
-                    Some(BookId::RussianSchool1a) => books::RS1A.iter().filter(|r| r.1 == page).map(|r| r.0).collect(),
-                    Some(BookId::RussianSchool1b) => books::RS1B.iter().filter(|r| r.1 == page).map(|r| r.0).collect(),
-                    _ => vec![],
-                };
-                if !on_page.is_empty() && on_page.len() == parts.len() {
-                    for (n, (id, _)) in on_page.iter().zip(&parts) {
-                        self.progress.book_links.insert(*n, id.clone());
-                    }
-                    self.omr_status = format!("Page {page} is playable: linked to no. {}. Check it against the page.", on_page.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "));
-                } else if !on_page.is_empty() {
-                    let choice = vec![None; parts.len()];
-                    self.pending_link = Some(PendingLink { page, book: book.unwrap(), parts, choice });
-                    self.omr_status = "Converted – tell PianoCraft which part is which piece.".into();
-                } else {
-                    self.omr_status = format!("Converted {} part(s) – they're in the Library.", parts.len());
-                }
-                self.progress.save();
             }
         }
     }
@@ -711,18 +653,17 @@ impl eframe::App for App {
             self.finished_prompt = true;
             self.progress.save();
         }
-        self.poll_omr();
         self.poll_convert();
+        self.poll_pdf_scan();
         self.poll_updates(ctx);
-        if self.omr_rx.is_some() || self.conv.as_ref().is_some_and(|c| !c.finished) {
+        if self.pdf_scan_rx.is_some() || self.conv.as_ref().is_some_and(|c| !c.finished) {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
             self.import_paths(dropped);
-            self.tab = Tab::Library;
         }
-        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) && self.cur.is_some() && self.tab == Tab::Practice {
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) && self.cur.is_some() && self.tab == Tab::Main {
             self.audio.send(if playing { Cmd::Pause } else { Cmd::Play });
         }
 
@@ -731,18 +672,8 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🎹 PianoCraft").size(20.0).strong());
                 ui.add_space(10.0);
-                for (t, name) in [
-                    (Tab::Today, "Today"),
-                    (Tab::Practice, "Practice"),
-                    (Tab::Book, "Books"),
-                    (Tab::Library, "Library"),
-                    (Tab::Technique, "Scales & technique"),
-                    (Tab::Reading, "Note reading"),
-                    (Tab::Find, "Find music"),
-                    (Tab::Settings, "Settings"),
-                ] {
-                    ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
-                }
+                ui.selectable_value(&mut self.tab, Tab::Main, RichText::new("🎵 Practise").size(15.0));
+                ui.selectable_value(&mut self.tab, Tab::Settings, RichText::new("⚙ Settings").size(15.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some(rel) = self.update.clone() {
                         let label = if self.busy_update { "Updating…".to_string() } else { format!("⬆ Update to {}", rel.title.trim_start_matches("PianoCraft ")) };
@@ -783,38 +714,23 @@ impl eframe::App for App {
                 }
             }
         }
-        if !self.msg.is_empty() || !self.omr_status.is_empty() {
+        if !self.msg.is_empty() {
             egui::TopBottomPanel::bottom("msg").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if self.omr_rx.is_some() {
-                        ui.spinner();
-                    }
-                    if !self.omr_status.is_empty() {
-                        ui.label(RichText::new(&self.omr_status).color(Color32::from_rgb(250, 220, 120)));
-                    }
                     ui.label(&self.msg);
                     if ui.small_button("×").clicked() {
                         self.msg.clear();
-                        if self.omr_rx.is_none() {
-                            self.omr_status.clear();
-                        }
                     }
                 });
             });
         }
 
-        self.link_dialog(ctx);
-
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Today => self.ui_today(ui),
-            Tab::Practice => self.ui_practice_tab(ui),
-            Tab::Book => self.ui_book(ui),
-            Tab::Library => self.ui_library(ui),
-            Tab::Technique => self.ui_technique(ui),
-            Tab::Reading => self.ui_reading(ui),
-            Tab::Find => self.ui_find(ui),
-            Tab::Settings => self.ui_settings(ui),
-        });
+        match self.tab {
+            Tab::Main => self.ui_main(ctx),
+            Tab::Settings => {
+                egui::CentralPanel::default().show(ctx, |ui| self.ui_settings(ui));
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -829,539 +745,6 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn link_dialog(&mut self, ctx: &egui::Context) {
-        let Some(pl) = self.pending_link.as_mut() else { return };
-        let on_page: Vec<(u32, &str)> = match pl.book {
-            BookId::RussianSchool1a => books::RS1A.iter().filter(|r| r.1 == pl.page).map(|r| (r.0, r.2)).collect(),
-            _ => books::RS1B.iter().filter(|r| r.1 == pl.page).map(|r| (r.0, r.2)).collect(),
-        };
-        let mut close = false;
-        egui::Window::new("Which piece is which?").collapsible(false).show(ctx, |ui| {
-            ui.label(format!("Audiveris found {} part(s) on page {}. Match them to the pieces (they're usually in order, top to bottom).", pl.parts.len(), pl.page));
-            for (k, (_, desc)) in pl.parts.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Part {} – {desc}", k + 1));
-                    egui::ComboBox::from_id_salt(("link", k)).selected_text(pl.choice[k].map(|n| format!("no. {n}")).unwrap_or("not a piece".into())).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut pl.choice[k], None, "not a piece");
-                        for (n, t) in &on_page {
-                            ui.selectable_value(&mut pl.choice[k], Some(*n), format!("no. {n} {t}"));
-                        }
-                    });
-                });
-            }
-            if ui.button("Save").clicked() {
-                close = true;
-            }
-        });
-        if close {
-            let pl = self.pending_link.take().unwrap();
-            for (k, c) in pl.choice.iter().enumerate() {
-                if let Some(n) = c {
-                    self.progress.book_links.insert(*n, pl.parts[k].0.clone());
-                }
-            }
-            self.progress.save();
-            self.omr_status = "Linked. Open the piece from Today to practise with sound.".into();
-        }
-    }
-
-    // ------------------------------------------------------------------ Today
-
-    fn ui_today(&mut self, ui: &mut egui::Ui) {
-        let us = units();
-        let suggested = current_unit(&self.progress);
-        egui::SidePanel::left("units").resizable(false).default_width(250.0).show_inside(ui, |ui| {
-            ui.heading("Your course");
-            ui.label(RichText::new("Russian School of Piano Playing from 1a chapter V, with Nahre Sol's approach alongside. Pick any unit to start there.").small().weak());
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, u) in us.iter().enumerate() {
-                    if i == 0 {
-                        ui.label(RichText::new("Book 1a").strong());
-                    }
-                    if i == 5 {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Book 1b").strong());
-                    }
-                    let done = u.pieces.iter().filter(|n| self.progress.done(&book_piece_id(**n))).count();
-                    let mark = if done == u.pieces.len() { "✔ " } else if i == suggested { "▶ " } else { "   " };
-                    let r = ui.selectable_label(self.unit_sel == i, format!("{mark}{}", u.title));
-                    if r.clicked() {
-                        self.unit_sel = i;
-                    }
-                    if done > 0 && done < u.pieces.len() {
-                        ui.label(RichText::new(format!("      {done}/{} pieces", u.pieces.len())).small().weak());
-                    }
-                }
-            });
-        });
-
-        let missing_books: Vec<BookId> = [BookId::RussianSchool1a, BookId::RussianSchool1b, BookId::ElementsOfMusic].into_iter().filter(|b| self.progress.book_path(*b).is_none()).collect();
-        let mut open_piece: Option<(Piece, bool)> = None;
-        let mut open_book_piece: Option<u32> = None;
-        let mut open_page: Option<(BookId, usize)> = None;
-        let mut start_reading: Option<u8> = None;
-        let mut omr: Option<(BookId, usize)> = None;
-        let mut do_install = false;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if !crate::install::is_installed() && !self.progress.install_prompt_dismissed {
-                egui::Frame::new().fill(Color32::from_rgb(28, 60, 44)).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Install PianoCraft: it gets its own Start menu entry and can update itself with one click.");
-                        if ui.add_enabled(!self.busy_update, egui::Button::new(RichText::new("Install").strong())).clicked() {
-                            do_install = true;
-                        }
-                        if ui.small_button("Not now").clicked() {
-                            self.progress.install_prompt_dismissed = true;
-                            self.progress.save();
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-            }
-            if !missing_books.is_empty() {
-                egui::Frame::new().fill(Color32::from_rgb(70, 50, 20)).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(format!("I can't find these books yet: {}. The lesson plan opens your own copies at the right page.", missing_books.iter().map(|b| b.short()).collect::<Vec<_>>().join(", ")));
-                    if ui.button("Set up books in Settings").clicked() {
-                        self.tab = Tab::Settings;
-                    }
-                });
-                ui.add_space(6.0);
-            }
-            let u = &us[self.unit_sel.min(us.len() - 1)];
-            ui.horizontal(|ui| {
-                ui.heading(u.title);
-                ui.label(RichText::new(format!("{} · from p. {}", u.book.short(), u.page)).weak());
-                if ui.button("📖 Open chapter").clicked() {
-                    open_page = Some((u.book, u.page));
-                }
-            });
-            ui.columns(2, |cols| {
-                card(&mut cols[0], |ui| {
-                    ui.label(RichText::new("Russian School").strong().color(Color32::from_rgb(230, 120, 110)));
-                    ui.label(u.russian);
-                });
-                card(&mut cols[1], |ui| {
-                    ui.label(RichText::new("Nahre Sol").strong().color(Color32::from_rgb(120, 200, 230)));
-                    ui.label(u.nahre);
-                });
-            });
-            ui.add_space(6.0);
-
-            // ---- the book pieces
-            let next_piece = u.pieces.iter().copied().find(|n| !self.progress.done(&book_piece_id(*n)));
-            ui.label(RichText::new("Pieces from the book").size(17.0).strong());
-            ui.label(RichText::new("Work on one new piece at a time, plus keep polishing the previous one. 'Practise' walks you through the Russian-School steps; 'Make playable' turns the page into notes you can hear and see falling.").small().weak());
-            for &n in &u.pieces {
-                let Some((b, r)) = books::piece_ref(n) else { continue };
-                let pid = book_piece_id(n);
-                let pp = self.progress.pieces.get(&pid).cloned().unwrap_or_default();
-                let done = self.progress.done(&pid);
-                let is_next = Some(n) == next_piece;
-                let linked = self.progress.book_links.contains_key(&n);
-                let frame = if is_next { egui::Frame::new().fill(Color32::from_rgb(34, 44, 58)).corner_radius(6.0).inner_margin(6.0) } else { egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 2)) };
-                frame.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let title = format!("{n}. {}", r.2);
-                        let t = if done { RichText::new(format!("✔ {title}")).color(green()) } else if is_next { RichText::new(format!("▶ {title}")).strong().color(accent()) } else { RichText::new(title) };
-                        ui.label(t.size(15.0));
-                        if !r.3.is_empty() {
-                            ui.label(RichText::new(r.3).small().weak());
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if !done && ui.small_button("I know it ✔").on_hover_text("Mark as learned").clicked() {
-                                self.progress.ticks.insert(pid.clone(), curriculum::today());
-                                self.progress.save();
-                            }
-                            if !linked && ui.small_button("Make playable").on_hover_text("Convert this page to notes with Audiveris").clicked() {
-                                omr = Some((b, r.1));
-                            }
-                            if ui.button(if linked { "Practise ▶ 🔊" } else { "Practise ▶" }).clicked() {
-                                open_book_piece = Some(n);
-                            }
-                            if ui.small_button(format!("p.{}", r.1)).on_hover_text("Open the page").clicked() {
-                                open_page = Some((b, r.1));
-                            }
-                            if !done && (pp.nailed_count > 0 || pp.rung > 0) {
-                                ui.label(RichText::new(format!("step {}", pp.rung + 1)).small().color(accent()));
-                            }
-                        });
-                    });
-                });
-            }
-            ui.add_space(10.0);
-
-            // ---- the rest of the session
-            ui.label(RichText::new("Technique, theory and ear").size(17.0).strong());
-            for task in &u.tasks {
-                match task {
-                    Task::Tech { role, spec, original } => {
-                        let piece = generate(spec);
-                        let pp = self.progress.pieces.get(&piece.id).cloned().unwrap_or_default();
-                        let rungs = ladder(&piece, true);
-                        card(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(*role).weak());
-                                    ui.label(RichText::new(&piece.title).size(16.0).strong());
-                                    ui.label(RichText::new(spec.subtitle()).small());
-                                    ui.label(status_line(&pp, &rungs));
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.button(RichText::new("Start ▶").size(15.0)).clicked() {
-                                        open_piece = Some((piece.clone(), true));
-                                    }
-                                    if ui.small_button("Customise").on_hover_text("Open in Scales & technique").clicked() {
-                                        self.tech = *spec;
-                                        self.tab = Tab::Technique;
-                                    }
-                                    if let Some((b, page, what)) = original {
-                                        if ui.small_button(format!("📖 {}", b.short())).on_hover_text(format!("{what} – p. {page}")).clicked() {
-                                            open_page = Some((*b, *page));
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                    }
-                    Task::Theory { id, book, page, title, what, reading } => {
-                        let done = self.progress.done(id);
-                        card(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new("Theory & reading").weak());
-                                    ui.label(RichText::new(*title).size(16.0).strong().color(if done { green() } else { Color32::WHITE }));
-                                    ui.label(RichText::new(*what).small());
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if !done && ui.small_button("Done ✔").clicked() {
-                                        self.progress.ticks.insert(id.to_string(), curriculum::today());
-                                        self.progress.save();
-                                    }
-                                    if let Some(l) = reading {
-                                        if ui.button("Reading trainer ▶").clicked() {
-                                            start_reading = Some(*l);
-                                        }
-                                    }
-                                    if ui.button(format!("📖 p.{page}")).clicked() {
-                                        open_page = Some((*book, *page));
-                                    }
-                                });
-                            });
-                        });
-                    }
-                    Task::Ear { id, title, what } => {
-                        let done = self.progress.done(id);
-                        card(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new("Ear & creativity").weak());
-                                    ui.label(RichText::new(*title).size(16.0).strong().color(if done { green() } else { Color32::WHITE }));
-                                    ui.label(RichText::new(*what).small());
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if !done && ui.small_button("Done ✔").clicked() {
-                                        self.progress.ticks.insert(id.to_string(), curriculum::today());
-                                        self.progress.save();
-                                    }
-                                });
-                            });
-                        });
-                    }
-                    Task::Builtin { id, why } => {
-                        if let Some(p) = self.find_piece(id) {
-                            card(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label(RichText::new("Extra piece").weak());
-                                        ui.label(RichText::new(&p.title).size(16.0).strong());
-                                        ui.label(RichText::new(*why).small());
-                                    });
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.button("Start ▶").clicked() {
-                                            open_piece = Some((p.clone(), false));
-                                        }
-                                    });
-                                });
-                            });
-                        }
-                    }
-                }
-            }
-            // repertoire at this unit's level
-            let grade: u8 = match self.unit_sel { 0..=3 => 1, 4..=7 => 2, _ => 3 };
-            let rep: Vec<Piece> = self.builtins.iter().filter(|p| crate::repertoire::grade_of(&p.id) == Some(grade) && !self.progress.done(&p.id)).take(3).cloned().collect();
-            card(ui, |ui| {
-                ui.label(RichText::new(format!("Repertoire at your level – Grade {grade}")).weak());
-                for p in &rep {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&p.title).size(15.0));
-                        ui.label(RichText::new(&p.composer).small().weak());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Start ▶").clicked() {
-                                open_piece = Some((p.clone(), false));
-                            }
-                        });
-                    });
-                }
-                if ui.small_button("See all 55 graded pieces in the Library").clicked() {
-                    self.lib_filter = 1;
-                    self.tab = Tab::Library;
-                }
-            });
-            // your own music near your level
-            let mut lib: Vec<(f32, Piece)> = self.progress.library.iter().filter(|p| !p.id.starts_with("omr-")).map(|p| (rate(p).score, p.clone())).filter(|(_, p)| !self.progress.done(&p.id)).collect();
-            lib.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            card(ui, |ui| {
-                ui.label(RichText::new("Your own music (optional)").weak());
-                if let Some((s, p)) = lib.first() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{}  ·  difficulty {:.1}", p.title, s)).size(15.0));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Start ▶").clicked() {
-                                open_piece = Some((p.clone(), false));
-                            }
-                        });
-                    });
-                } else {
-                    ui.label("Import a song (MIDI or MusicXML) in Library or Find music and it shows up here – PianoCraft builds easier versions for you.");
-                }
-            });
-        });
-        if let Some((p, d)) = open_piece {
-            self.open_piece(p, d, None);
-        }
-        if let Some(n) = open_book_piece {
-            self.open_book_piece(n);
-        }
-        if let Some((b, page)) = open_page {
-            self.open_book_page(b, page);
-        }
-        if do_install {
-            self.start_install(false);
-        }
-        if let Some(l) = start_reading {
-            self.trainer = Trainer::new(l);
-            self.tab = Tab::Reading;
-        }
-        if let Some((b, page)) = omr {
-            if let Some(path) = self.progress.book_path(b) {
-                self.start_omr(Some(b), path, page);
-            } else {
-                self.msg = format!("Can't find {} – set it up in Settings.", b.short());
-            }
-        }
-    }
-
-    fn open_book_page(&mut self, b: BookId, page: usize) {
-        match self.progress.book_path(b) {
-            Some(path) => {
-                self.bookview.open(path, page);
-                self.current_book = Some(b);
-                self.tab = Tab::Book;
-            }
-            None => {
-                self.msg = format!("Can't find {} on this computer – point PianoCraft to it in Settings → Your books.", b.title());
-                self.tab = Tab::Settings;
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------ Books
-
-    fn ui_book(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let found: Vec<BookId> = BookId::ALL.iter().copied().filter(|b| self.progress.book_path(*b).is_some()).collect();
-            egui::ComboBox::from_id_salt("bookpick").width(360.0).selected_text(self.current_book.map(|b| b.title()).unwrap_or("Choose a book…")).show_ui(ui, |ui| {
-                for b in found {
-                    if ui.selectable_label(self.current_book == Some(b), b.title()).clicked() {
-                        let page = if b == BookId::RussianSchool1a { 24 } else { 1 };
-                        if let Some(p) = self.progress.book_path(b) {
-                            self.bookview.open(p, page);
-                        }
-                        self.current_book = Some(b);
-                    }
-                }
-            });
-            if let Some(path) = self.bookview.path.clone() {
-                let page = self.bookview.page;
-                if ui.button("🔊 Make this page playable").on_hover_text("Typeset PDFs are read instantly; scanned pages use Audiveris").clicked() {
-                    self.start_omr(self.current_book, path.clone(), page);
-                }
-                if ui.button("📚 Whole book").on_hover_text("Make every page playable in one go. Typeset PDFs take seconds; scanned books take about a minute per page with Audiveris, in the background.").clicked() {
-                    self.start_convert(vec![Job { pdf: path, pages: None }], true);
-                }
-            }
-        });
-        // pieces on this page
-        if let Some(b) = self.current_book {
-            let page = self.bookview.page;
-            let refs: Vec<books::PieceRef> = match b {
-                BookId::RussianSchool1a => books::RS1A.iter().filter(|r| r.1 == page).copied().collect(),
-                BookId::RussianSchool1b => books::RS1B.iter().filter(|r| r.1 == page).copied().collect(),
-                _ => vec![],
-            };
-            if !refs.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("On this page:");
-                    for r in refs {
-                        if ui.button(format!("{}. {} – practise ▶", r.0, r.2)).clicked() {
-                            self.open_book_piece(r.0);
-                            return;
-                        }
-                    }
-                });
-            }
-        }
-        self.bookview.toolbar(ui);
-        ui.separator();
-        self.bookview.show(ui);
-    }
-
-    // ------------------------------------------------------------------ Practice
-
-    fn ui_practice_tab(&mut self, ui: &mut egui::Ui) {
-        if self.book_only.is_some() {
-            self.ui_book_only(ui);
-            return;
-        }
-        if self.cur.is_none() {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("Nothing loaded yet");
-                ui.label("Pick something from Today, the Library, or Scales & technique.");
-                if ui.button("Go to Today's lesson").clicked() {
-                    self.tab = Tab::Today;
-                }
-            });
-            return;
-        }
-        let has_book = self.cur.as_ref().is_some_and(|c| c.book_piece.is_some()) && self.bookview.path.is_some();
-        if has_book && self.show_book_beside {
-            egui::SidePanel::left("bookside").resizable(true).default_width(ui.available_width() * 0.42).show_inside(ui, |ui| {
-                self.bookview.toolbar(ui);
-                self.bookview.show(ui);
-            });
-        }
-        self.ui_practice(ui, has_book);
-    }
-
-    /// Practising straight from the book page (the Russian-School steps, metronome, repetitions).
-    fn ui_book_only(&mut self, ui: &mut egui::Ui) {
-        let bo = self.book_only.as_ref().unwrap();
-        let n = bo.number;
-        let pid = book_piece_id(n);
-        let pp = self.progress.pieces.get(&pid).cloned().unwrap_or_default();
-        let rungs = bo.rungs.clone();
-        let ri = pp.rung.min(rungs.len() - 1);
-        let rung = rungs[ri].clone();
-        let (book, r) = books::piece_ref(n).unwrap();
-        let mut fb = None;
-        let mut jump = None;
-        egui::SidePanel::right("method").resizable(true).default_width(420.0).show_inside(ui, |ui| {
-            ui.label(RichText::new(format!("{n}. {}", r.2)).size(22.0).strong());
-            ui.label(RichText::new(format!("{} · p. {} {}", book.short(), r.1, if r.3.is_empty() { String::new() } else { format!("· {}", r.3) })).weak());
-            ui.add_space(6.0);
-            egui::Frame::new().fill(Color32::from_rgb(34, 44, 58)).corner_radius(8.0).inner_margin(10.0).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(ri > 0, egui::Button::new("◀")).clicked() {
-                        jump = Some(ri - 1);
-                    }
-                    ui.label(RichText::new(format!("Step {} of {}: {}", ri + 1, rungs.len(), rung.label)).size(16.0).strong().color(accent()));
-                    if ui.add_enabled(ri + 1 < rungs.len(), egui::Button::new("▶")).clicked() {
-                        jump = Some(ri + 1);
-                    }
-                });
-                ui.label(rung.how);
-                if rung.tempo_pct < 100 && !rung.listen {
-                    ui.label(RichText::new(format!("Aim for about {}% of the final speed.", pp.tempo_pct.unwrap_or(rung.tempo_pct))).small());
-                }
-                if let Some((a, b)) = pp.section {
-                    let half = if a == 1 { "first part" } else { "next part" };
-                    ui.label(RichText::new(format!("Focus on the {half} only (chunk {a}–{b} of 8)")).color(Color32::from_rgb(230, 150, 230)));
-                }
-                if !self.plan_msg.is_empty() {
-                    ui.label(RichText::new(&self.plan_msg).color(Color32::from_rgb(250, 220, 120)));
-                }
-            });
-            ui.add_space(8.0);
-            ui.label(RichText::new("Metronome").strong());
-            let bo = self.book_only.as_mut().unwrap();
-            ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut bo.bpm, 30.0..=180.0).suffix(" bpm").integer());
-                ui.add(egui::DragValue::new(&mut bo.beats).range(2..=12).suffix(" beats/bar"));
-            });
-            let (bpm, beats) = (bo.bpm, bo.beats);
-            ui.horizontal(|ui| {
-                if !self.metro_only {
-                    if ui.button(RichText::new("▶ Start metronome").size(15.0)).clicked() {
-                        self.start_metronome_only(bpm, beats);
-                    }
-                } else if ui.button(RichText::new("⏸ Stop").size(15.0)).clicked() {
-                    self.stop_metronome_only();
-                }
-                ui.label(RichText::new("Start slow – the Russian School never rushes.").small().weak());
-            });
-            ui.add_space(8.0);
-            ui.label(RichText::new("Repetitions").strong());
-            let bo = self.book_only.as_mut().unwrap();
-            ui.horizontal(|ui| {
-                for i in 0..bo.reps_target {
-                    let filled = i < bo.reps_done;
-                    let (rr, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                    ui.painter().circle(rr.center(), 9.0, if filled { green() } else { Color32::TRANSPARENT }, Stroke::new(2.0, green()));
-                }
-                if ui.button("+1 clean play-through").clicked() {
-                    bo.reps_done += 1;
-                }
-                ui.add(egui::DragValue::new(&mut bo.reps_target).range(1..=10).prefix("target "));
-            });
-            let reps_ok = bo.reps_done >= bo.reps_target;
-            if reps_ok {
-                ui.label(RichText::new("Target reached – ready for the next step?").color(green()));
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Too hard – smaller step").size(15.0)).clicked() {
-                    fb = Some(Feedback::TooHard);
-                }
-                if ui.button(RichText::new("✅ Nailed it – next step").size(15.0)).clicked() {
-                    fb = Some(Feedback::Nailed);
-                }
-            });
-            ui.add_space(14.0);
-            ui.separator();
-            ui.label(RichText::new("Hear it and see the notes falling").strong());
-            ui.label(RichText::new("Convert this page with Audiveris (free, runs on your PC). Then 'Practise' plays it, loops bars, slows it down, splits the hands – with the page beside it.").small());
-            if ui.button("🔊 Make this page playable").clicked() {
-                if let Some(path) = self.progress.book_path(book) {
-                    self.start_omr(Some(book), path, r.1);
-                }
-            }
-        });
-        // the page itself
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.bookview.toolbar(ui);
-            self.bookview.show(ui);
-        });
-        if let Some(j) = jump {
-            let pp = self.progress.pieces.entry(pid.clone()).or_default();
-            pp.rung = j;
-            pp.tempo_pct = None;
-            pp.section = None;
-            self.progress.save();
-            self.book_only.as_mut().unwrap().reps_done = 0;
-        }
-        if let Some(f) = fb {
-            self.feedback_for(pid, rungs, 8, format!("{n}. {}", r.2), f);
-            self.book_only.as_mut().unwrap().reps_done = 0;
-        }
-    }
-
     fn ui_practice(&mut self, ui: &mut egui::Ui, has_book: bool) {
         let pos = self.audio.shared.pos();
         let playing = self.audio.shared.playing.load(Ordering::Relaxed);
@@ -1682,9 +1065,8 @@ impl App {
                 if ui.button(RichText::new("✅ Nailed it – next step").size(15.0)).clicked() {
                     fb = Some(Feedback::Nailed);
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add(egui::Slider::new(&mut self.lookahead_bars, 1.0..=6.0).text("bars ahead").fixed_decimals(0));
-                });
+                ui.separator();
+                ui.add(egui::DragValue::new(&mut self.lookahead_bars).range(1.0..=6.0).speed(0.05).fixed_decimals(0).prefix("see ").suffix(" bars ahead"));
             });
         });
 
@@ -1709,361 +1091,11 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------------ Library
-
-    fn ui_library(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Library");
-        ui.label("Everything you can practise. Drag MIDI or MusicXML files onto this window to add them – PianoCraft rates the difficulty and builds easier versions for you.");
-        ui.horizontal(|ui| {
-            #[cfg(windows)]
-            if ui.button("📂 Import file…").clicked() {
-                if let Some(paths) = rfd::FileDialog::new().add_filter("Music", &["mid", "midi", "musicxml", "xml", "mxl"]).pick_files() {
-                    self.import_paths(paths);
-                }
-            }
-            ui.label("or path:");
-            ui.add(egui::TextEdit::singleline(&mut self.import_path).desired_width(380.0).hint_text(r"C:\path\to\song.mid"));
-            if ui.button("Import").clicked() && !self.import_path.trim().is_empty() {
-                let p = PathBuf::from(self.import_path.trim().trim_matches('"'));
-                self.import_paths(vec![p]);
-            }
-        });
-        egui::CollapsingHeader::new("📁 Your music folders").default_open(true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.progress.scan_folder).desired_width(460.0).hint_text(r"C:\Music\Piano; C:\Music\Guitar"));
-                let first = !self.scanned_once && !self.progress.scan_folder.trim().is_empty();
-                if ui.button("Scan").clicked() || first {
-                    self.scanned_once = true;
-                    self.scan_results = self.progress.scan_folder.split(';').map(str::trim).filter(|f| !f.is_empty()).flat_map(|f| scan(&PathBuf::from(f.trim_matches('"')))).collect();
-                    self.msg = format!("Found {} music files.", self.scan_results.len());
-                    self.progress.save();
-                }
-            });
-            ui.label(RichText::new("Several folders: separate them with ;  (your guitar folder works too – guitar music is moved down to where a guitar sounds and split between the hands).").small().weak());
-            let pdfs: Vec<PathBuf> = self.scan_results.iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))).cloned().collect();
-            if !pdfs.is_empty() {
-                let todo: Vec<PathBuf> = pdfs.iter().filter(|p| self.conv_redo || !self.converted_from(p)).cloned().collect();
-                ui.horizontal(|ui| {
-                    let busy = self.conv.as_ref().is_some_and(|c| !c.finished);
-                    if ui.add_enabled(!busy && !todo.is_empty(), egui::Button::new(RichText::new(format!("🔊 Make all {} PDFs playable", todo.len())).strong())).on_hover_text("Typeset sheet music (MuseScore, Sibelius, Dorico, Finale…) is read in seconds. PDFs that aren't music are skipped and never changed.").clicked() {
-                        let jobs = todo.iter().map(|p| Job { pdf: p.clone(), pages: None }).collect();
-                        self.start_convert(jobs, self.conv_scans);
-                    }
-                    ui.checkbox(&mut self.conv_scans, "include scanned books").on_hover_text("Scans (pictures of pages) go through Audiveris, about a minute per page – a whole book can take an hour or more. It runs in the background.");
-                    ui.checkbox(&mut self.conv_redo, "convert again");
-                });
-                if self.conv_scans && find_audiveris(&self.progress.audiveris).is_none() {
-                    ui.label(RichText::new("Audiveris isn't installed, so scanned books will be skipped (Settings → Make pages playable).").small().color(Color32::from_rgb(250, 200, 120)));
-                }
-            }
-            if let Some(c) = &self.conv {
-                if c.finished && !c.skipped.is_empty() {
-                    ui.collapsing(format!("Skipped last time ({})", c.skipped.len()), |ui| {
-                        egui::ScrollArea::vertical().id_salt("skipped").max_height(140.0).show(ui, |ui| {
-                            for (p, why) in &c.skipped {
-                                ui.label(RichText::new(format!("{} – {why}", p.file_name().and_then(|n| n.to_str()).unwrap_or("?"))).small());
-                            }
-                        });
-                    });
-                }
-            }
-            let mut to_import = vec![];
-            let mut to_open = None;
-            let mut to_convert: Vec<PathBuf> = vec![];
-            egui::ScrollArea::vertical().id_salt("scan").max_height(220.0).show(ui, |ui| {
-                for p in &self.scan_results {
-                    ui.horizontal(|ui| {
-                        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                        if ext == "pdf" {
-                            let done = self.progress.library.iter().any(|x| matches!(&x.origin, Origin::Imported(o) if *o == p.display().to_string()) && x.id.starts_with("pdf-"));
-                            ui.label(RichText::new(format!("{} {name}", if done { "✅" } else { "📄" })).weak());
-                            if ui.small_button("open").clicked() {
-                                to_open = Some(p.clone());
-                            }
-                            if !done && ui.small_button("make playable").clicked() {
-                                to_convert.push(p.clone());
-                            }
-                        } else {
-                            ui.label(format!("🎵 {name}"));
-                            if ui.small_button("import").clicked() {
-                                to_import.push(p.clone());
-                            }
-                        }
-                    });
-                }
-            });
-            if !to_import.is_empty() {
-                self.import_paths(to_import);
-            }
-            if !to_convert.is_empty() {
-                let jobs = to_convert.into_iter().map(|p| Job { pdf: p, pages: None }).collect();
-                self.start_convert(jobs, true);
-            }
-            if let Some(p) = to_open {
-                self.current_book = BookId::ALL.iter().copied().find(|b| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| b.matches(n)));
-                self.bookview.open(p, 1);
-                self.tab = Tab::Book;
-            }
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Show:");
-            for (i, name) in ["Everything", "Repertoire (graded)", "Course pieces", "Your imports"].iter().enumerate() {
-                ui.selectable_value(&mut self.lib_filter, i as u8, *name);
-            }
-        });
-        let filter = self.lib_filter;
-        // sort key: repertoire by grade, everything else by computed difficulty mapped onto the same 1–8 scale
-        let mut rows: Vec<(Piece, f32)> = self
-            .builtins
-            .iter()
-            .chain(self.progress.library.iter())
-            .filter(|p| match filter {
-                1 => p.id.starts_with("rep-"),
-                2 => matches!(p.origin, Origin::BuiltIn) && !p.id.starts_with("rep-"),
-                3 => matches!(p.origin, Origin::Imported(_)),
-                _ => true,
-            })
-            .map(|p| (p.clone(), crate::repertoire::grade_of(&p.id).map(|g| g as f32).unwrap_or_else(|| rate(p).score * 0.8)))
-            .collect();
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.title.cmp(&b.0.title)));
-        let mut open = None;
-        let mut remove = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("lib").striped(true).num_columns(6).spacing(Vec2::new(16.0, 8.0)).show(ui, |ui| {
-                ui.strong("Level");
-                ui.strong("Title");
-                ui.strong("Key");
-                ui.strong("Source");
-                ui.strong("Your progress");
-                ui.strong("");
-                ui.end_row();
-                for (p, d) in &rows {
-                    let col = if *d < 3.0 { green() } else if *d < 5.5 { Color32::from_rgb(240, 200, 80) } else { Color32::from_rgb(240, 110, 90) };
-                    let lvl = match crate::repertoire::grade_of(&p.id) {
-                        Some(g) => format!("Grade {g}"),
-                        None => format!("≈ {:.0}", d.max(1.0)),
-                    };
-                    ui.label(RichText::new(lvl).color(col).strong()).on_hover_text("Grades are approximate (ABRSM-style, 1–8). '≈' = estimated from the notes.");
-                    ui.vertical(|ui| {
-                        ui.set_min_width(360.0);
-                        ui.label(RichText::new(&p.title).strong());
-                        if !p.composer.is_empty() {
-                            ui.label(RichText::new(&p.composer).small().weak());
-                        }
-                    });
-                    ui.label(p.key_name());
-                    ui.label(match &p.origin {
-                        Origin::BuiltIn if p.id.starts_with("rep-") => "repertoire".to_string(),
-                        Origin::BuiltIn => "built-in".to_string(),
-                        Origin::Generated => "generated".into(),
-                        Origin::Imported(_) if p.id.starts_with("omr-") => "from your book".into(),
-                        Origin::Imported(_) => "imported".into(),
-                    });
-                    let pp = self.progress.pieces.get(&p.id).cloned().unwrap_or_default();
-                    ui.add(egui::Label::new(status_line(&pp, &ladder(p, false))).wrap_mode(egui::TextWrapMode::Extend));
-                    ui.horizontal(|ui| {
-                        if ui.button("Practise ▶").clicked() {
-                            open = Some(p.clone());
-                        }
-                        if matches!(p.origin, Origin::Imported(_)) && ui.small_button("🗑").on_hover_text("Remove from library").clicked() {
-                            remove = Some(p.id.clone());
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-        });
-        if let Some(p) = open {
-            let link = self.progress.book_links.iter().find(|(_, id)| **id == p.id).map(|(n, _)| *n);
-            self.open_piece(p, false, link);
-        }
-        if let Some(id) = remove {
-            self.progress.library.retain(|p| p.id != id);
-            self.progress.library_changed();
-            self.progress.book_links.retain(|_, v| *v != id);
-            self.progress.save();
-        }
-    }
-
     // ------------------------------------------------------------------ Technique
-
-    fn ui_technique(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Scales & technique");
-        ui.label("Build any exercise: every mode, 1–4 octaves, patterns, rhythms, accents, both hands in any arrangement, and chains through keys. Fingering is worked out for you.");
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Quick picks:").strong());
-            let presets: [(&str, TechSpec); 8] = [
-                ("Russian: C major, contrary", TechSpec { motion: Motion::Contrary, ..TechSpec::default() }),
-                ("Russian: triplet sequence", TechSpec { pattern: Pattern::Groups3, rhythm: Rhythm::Eighths, ..TechSpec::default() }),
-                ("Russian: triad inversions", TechSpec { ex: Exercise::TriadInversions, motion: Motion::Parallel, ..TechSpec::default() }),
-                ("Nahre: circling scale", TechSpec { pattern: Pattern::Circling, rhythm: Rhythm::Eighths, accent: Accent::Swell, ..TechSpec::default() }),
-                ("Nahre: LH swell", TechSpec { ex: Exercise::LhSwell, motion: Motion::Parallel, rhythm: Rhythm::Eighths, ..TechSpec::default() }),
-                ("Nahre: ii–V–I chain", TechSpec { ex: Exercise::Progression, progression: Progression::TwoFiveOne, motion: Motion::Parallel, cycle: Cycle::WholeTones, ..TechSpec::default() }),
-                ("Nahre: measured trill", TechSpec { ex: Exercise::Trill, motion: Motion::Parallel, ..TechSpec::default() }),
-                ("Modes from C", TechSpec { scale: ScaleType::Dorian, tonic: 2, ..TechSpec::default() }),
-            ];
-            for (name, p) in presets {
-                if ui.small_button(name).clicked() {
-                    self.tech = p;
-                }
-            }
-        });
-        ui.separator();
-        let s = &mut self.tech;
-        let mut go = false;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("tech").num_columns(2).spacing(Vec2::new(12.0, 9.0)).show(ui, |ui| {
-                ui.label("Exercise");
-                ui.horizontal_wrapped(|ui| {
-                    for e in Exercise::ALL {
-                        ui.selectable_value(&mut s.ex, e, e.label());
-                    }
-                });
-                ui.end_row();
-                let uses_scale = matches!(s.ex, Exercise::Scale | Exercise::FiveFinger | Exercise::LhSwell | Exercise::TriadInversions | Exercise::Cadence);
-                if uses_scale {
-                    ui.label("Scale / mode");
-                    egui::ComboBox::from_id_salt("scale").width(320.0).selected_text(s.scale.label()).show_ui(ui, |ui| {
-                        for t in ScaleType::ALL {
-                            ui.selectable_value(&mut s.scale, t, t.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if s.ex == Exercise::Arpeggio {
-                    ui.label("Chord");
-                    ui.horizontal_wrapped(|ui| {
-                        for c in ChordType::ALL {
-                            ui.selectable_value(&mut s.chord, c, c.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if s.ex == Exercise::Progression {
-                    ui.label("Progression");
-                    ui.horizontal_wrapped(|ui| {
-                        for p in Progression::ALL {
-                            ui.selectable_value(&mut s.progression, p, p.label());
-                        }
-                        ui.checkbox(&mut s.sevenths, "with 7ths (rootless right hand)");
-                    });
-                    ui.end_row();
-                }
-                if s.ex != Exercise::EtudeSeed {
-                    ui.label("Starting key");
-                    ui.horizontal_wrapped(|ui| {
-                        for pc in 0..12u8 {
-                            ui.selectable_value(&mut s.tonic, pc, pc_name(pc, sig_for(pc, s.scale)));
-                        }
-                    });
-                    ui.end_row();
-                }
-                if matches!(s.ex, Exercise::Scale | Exercise::Arpeggio | Exercise::LhSwell) {
-                    ui.label("Octaves");
-                    ui.horizontal(|ui| {
-                        for o in 1..=4u8 {
-                            ui.selectable_value(&mut s.octaves, o, o.to_string());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if matches!(s.ex, Exercise::Scale | Exercise::Arpeggio | Exercise::FiveFinger | Exercise::TriadInversions) {
-                    ui.label("Pattern");
-                    egui::ComboBox::from_id_salt("pat").width(320.0).selected_text(s.pattern.label()).show_ui(ui, |ui| {
-                        for p in Pattern::ALL {
-                            ui.selectable_value(&mut s.pattern, p, p.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if s.ex != Exercise::Rhythm {
-                    ui.label("Hands");
-                    ui.horizontal_wrapped(|ui| {
-                        for m in Motion::ALL {
-                            ui.selectable_value(&mut s.motion, m, m.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if !matches!(s.ex, Exercise::Trill | Exercise::EtudeSeed | Exercise::TriadInversions | Exercise::Cadence) {
-                    ui.label("Rhythm");
-                    ui.horizontal_wrapped(|ui| {
-                        for r in Rhythm::ALL {
-                            ui.selectable_value(&mut s.rhythm, r, r.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if matches!(s.ex, Exercise::Scale | Exercise::Arpeggio | Exercise::FiveFinger | Exercise::TriadInversions) {
-                    ui.label("Accents / dynamics");
-                    ui.horizontal_wrapped(|ui| {
-                        for a in Accent::ALL {
-                            ui.selectable_value(&mut s.accent, a, a.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-                if s.ex == Exercise::Trill {
-                    ui.label("Trill fingers");
-                    ui.horizontal(|ui| {
-                        for pair in [(1, 2), (1, 3), (2, 3), (2, 4), (3, 4), (3, 5), (4, 5)] {
-                            ui.selectable_value(&mut s.trill_fingers, pair, format!("{}-{}", pair.0, pair.1));
-                        }
-                        ui.checkbox(&mut s.trill_half_step, "half step");
-                    });
-                    ui.end_row();
-                }
-                if s.ex == Exercise::EtudeSeed {
-                    ui.label("Seed");
-                    ui.horizontal(|ui| {
-                        for k in 1..=3u32 {
-                            ui.selectable_value(&mut s.seed, k, seed_name(k));
-                        }
-                    });
-                    ui.end_row();
-                }
-                if s.ex == Exercise::Rhythm {
-                    ui.label("Rhythm no.");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut s.seed).range(1..=999));
-                        if ui.small_button("New rhythm").clicked() {
-                            s.seed += 1;
-                        }
-                    });
-                    ui.end_row();
-                }
-                if !matches!(s.ex, Exercise::EtudeSeed | Exercise::Rhythm) {
-                    ui.label("Keys");
-                    egui::ComboBox::from_id_salt("cyc").width(320.0).selected_text(s.cycle.label()).show_ui(ui, |ui| {
-                        for c in Cycle::ALL {
-                            ui.selectable_value(&mut s.cycle, c, c.label());
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-            ui.add_space(10.0);
-            ui.label(RichText::new(s.title()).size(18.0).strong());
-            ui.label(RichText::new(s.subtitle()).weak());
-            ui.label(RichText::new(s.ex.tip()).small().italics());
-            ui.add_space(6.0);
-            if ui.button(RichText::new("Practise this ▶").size(17.0)).clicked() {
-                go = true;
-            }
-        });
-        if go {
-            let p = generate(&self.tech);
-            self.open_piece(p, true, None);
-        }
-    }
 
     // ------------------------------------------------------------------ Reading trainer
 
     fn ui_reading(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Note reading");
         ui.label("Nahre Sol's reference-point method (Elements of Music, ch. 2): learn a few landmark notes, then read every other note as a step or skip from the nearest landmark. Click the key – or play it on your piano.");
         ui.horizontal(|ui| {
             for (i, (name, desc)) in reading::LEVELS.iter().enumerate() {
@@ -2096,6 +1128,11 @@ impl App {
                     ui.label(RichText::new(format!("✔ {}", crate::model::pitch_name(p, false))).size(20.0).color(green()));
                 } else {
                     ui.label(RichText::new(format!("× that was {}", crate::model::pitch_name(p, false))).size(20.0).color(Color32::LIGHT_RED));
+                    ui.label(if p < 60 {
+                        "It was in the BASS clef (bottom staff). Its lines, from the bottom, are G B D F A and its spaces A C E G – so the same line or space is a different note than in the treble clef. The two dots of the clef sit either side of the F line."
+                    } else {
+                        "It was in the TREBLE clef (top staff). Its lines, from the bottom, are E G B D F and its spaces F A C E. The clef curls round G, the second line."
+                    });
                 }
             }
             ui.add_space(8.0);
@@ -2204,16 +1241,50 @@ impl App {
                 }
             });
             ui.add_space(12.0);
-            ui.heading("Your books");
-            ui.label("PianoCraft opens your own PDFs at the right page. It looks for them in your piano folder.");
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.progress.scan_folder).desired_width(460.0));
-                if ui.button("Find my books here").clicked() {
-                    let found = books::locate(&PathBuf::from(&self.progress.scan_folder));
-                    for (id, p) in &found {
-                        self.progress.books.insert(*id, p.display().to_string());
+            ui.heading("Your music folders");
+            card(ui, |ui| {
+                ui.label("Every PDF, MIDI and MusicXML file in these folders appears on the left under 'Books & sheet music'. Separate several folders with ;");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.progress.scan_folder).desired_width(520.0).hint_text(r"C:\Music\Piano; C:\Music\Guitar"));
+                    if ui.button("Look again").clicked() {
+                        action = Some("rescan");
                     }
-                    self.msg = format!("Found {} of {} books.", found.len(), BookId::ALL.len());
+                });
+                ui.label(RichText::new(format!("{} PDFs found.", self.progress.pdf_index.len())).small().weak());
+                ui.add_space(4.0);
+                let todo: Vec<PathBuf> = self.progress.pdf_index.iter().map(PathBuf::from).filter(|p| self.conv_redo || !self.converted_from(p)).collect();
+                ui.horizontal(|ui| {
+                    let busy = self.conv.as_ref().is_some_and(|c| !c.finished);
+                    if ui.add_enabled(!busy && !todo.is_empty(), egui::Button::new(format!("🔊 Make all {} PDFs playable", todo.len()))).on_hover_text("Typeset sheet music is read in seconds. Scanned books need Audiveris (tick below). PDFs that aren't music are skipped and never changed.").clicked() {
+                        action = Some("convert_all");
+                    }
+                    ui.checkbox(&mut self.conv_scans, "include scanned books (slow)");
+                    ui.checkbox(&mut self.conv_redo, "convert again");
+                });
+                ui.label(RichText::new("You don't have to do this: any PDF is made playable by itself the first time you open an exercise in it.").small().weak());
+                if let Some(c) = &self.conv {
+                    if c.finished && !c.skipped.is_empty() {
+                        ui.collapsing(format!("Skipped last time ({})", c.skipped.len()), |ui| {
+                            for (p, why) in &c.skipped {
+                                ui.label(RichText::new(format!("{} – {why}", p.file_name().and_then(|n| n.to_str()).unwrap_or("?"))).small());
+                            }
+                        });
+                    }
+                }
+            });
+            ui.add_space(12.0);
+            ui.heading("Your books");
+            ui.label("The course opens your own copies at the right page. PianoCraft finds them in your music folders by name; if one isn't found, point to it here.");
+            ui.horizontal(|ui| {
+                if ui.button("Find my books in my music folders").clicked() {
+                    let mut n = 0;
+                    for f in self.progress.scan_folder.split(';').map(|f| f.trim().trim_matches('"')).filter(|f| !f.is_empty()) {
+                        for (id, p) in books::locate(&PathBuf::from(f)) {
+                            self.progress.books.insert(id, p.display().to_string());
+                            n += 1;
+                        }
+                    }
+                    self.msg = format!("Found {n} of {} books.", BookId::ALL.len());
                     self.progress.save();
                 }
             });
@@ -2345,6 +1416,15 @@ impl App {
             });
         });
         match action {
+            Some("rescan") => {
+                self.progress.save();
+                self.rescan_pdfs();
+            }
+            Some("convert_all") => {
+                let jobs = self.progress.pdf_index.iter().map(PathBuf::from).filter(|p| self.conv_redo || !self.converted_from(p)).map(|pdf| Job { pdf, pages: None }).collect();
+                let scans = self.conv_scans;
+                self.start_convert(jobs, scans);
+            }
             Some("check") => self.check_updates(true),
             Some("install") => self.start_install(false),
             Some("install_desktop") => self.start_install(true),
@@ -2363,24 +1443,6 @@ impl App {
             _ => {}
         }
     }
-}
-
-fn status_line(pp: &PieceProgress, rungs: &[Rung]) -> RichText {
-    if pp.done {
-        return RichText::new("✔ Mastered").color(green());
-    }
-    if pp.rung == 0 && pp.nailed_count == 0 && pp.too_hard_count == 0 {
-        return RichText::new("Not started").weak();
-    }
-    let r = &rungs[pp.rung.min(rungs.len() - 1)];
-    let mut s = format!("Step {}/{}: {}", pp.rung + 1, rungs.len(), r.label);
-    if let Some(t) = pp.tempo_pct {
-        s.push_str(&format!(" @ {t}%"));
-    }
-    if let Some((a, b)) = pp.section {
-        s.push_str(&format!(" · bars {a}–{b}"));
-    }
-    RichText::new(s).color(accent())
 }
 
 fn scan(dir: &PathBuf) -> Vec<PathBuf> {
@@ -2427,4 +1489,154 @@ fn urlencode(s: &str) -> String {
         }
     }
     o
+}
+
+/// Ready-made technique exercises (Russian School and Nahre Sol).
+pub(crate) fn tech_presets() -> [(&'static str, TechSpec); 8] {
+    [
+        ("Russian: C major, contrary", TechSpec { motion: Motion::Contrary, ..TechSpec::default() }),
+        ("Russian: triplet sequence", TechSpec { pattern: Pattern::Groups3, rhythm: Rhythm::Eighths, ..TechSpec::default() }),
+        ("Russian: triad inversions", TechSpec { ex: Exercise::TriadInversions, motion: Motion::Parallel, ..TechSpec::default() }),
+        ("Nahre: circling scale", TechSpec { pattern: Pattern::Circling, rhythm: Rhythm::Eighths, accent: Accent::Swell, ..TechSpec::default() }),
+        ("Nahre: LH swell", TechSpec { ex: Exercise::LhSwell, motion: Motion::Parallel, rhythm: Rhythm::Eighths, ..TechSpec::default() }),
+        ("Nahre: ii–V–I chain", TechSpec { ex: Exercise::Progression, progression: Progression::TwoFiveOne, motion: Motion::Parallel, cycle: Cycle::WholeTones, ..TechSpec::default() }),
+        ("Nahre: measured trill", TechSpec { ex: Exercise::Trill, motion: Motion::Parallel, ..TechSpec::default() }),
+        ("Modes from C", TechSpec { scale: ScaleType::Dorian, tonic: 2, ..TechSpec::default() }),
+    ]
+}
+
+/// The exercise builder. Returns true when something changed.
+fn tech_controls(ui: &mut egui::Ui, s: &mut TechSpec) -> bool {
+    let before = *s;
+    ui.vertical(|ui| {
+        ui.label(RichText::new("Exercise").small().strong());
+        ui.horizontal_wrapped(|ui| {
+            for e in Exercise::ALL {
+                ui.selectable_value(&mut s.ex, e, e.label());
+            }
+        });
+        ui.add_space(6.0);
+        let uses_scale = matches!(s.ex, Exercise::Scale | Exercise::FiveFinger | Exercise::LhSwell | Exercise::TriadInversions | Exercise::Cadence);
+        if uses_scale {
+            ui.label(RichText::new("Scale / mode").small().strong());
+            egui::ComboBox::from_id_salt("scale").width(ui.available_width().min(320.0)).selected_text(s.scale.label()).show_ui(ui, |ui| {
+                for t in ScaleType::ALL {
+                    ui.selectable_value(&mut s.scale, t, t.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex == Exercise::Arpeggio {
+            ui.label(RichText::new("Chord").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                for c in ChordType::ALL {
+                    ui.selectable_value(&mut s.chord, c, c.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex == Exercise::Progression {
+            ui.label(RichText::new("Progression").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                for p in Progression::ALL {
+                    ui.selectable_value(&mut s.progression, p, p.label());
+                }
+                ui.checkbox(&mut s.sevenths, "with 7ths (rootless right hand)");
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex != Exercise::EtudeSeed {
+            ui.label(RichText::new("Starting key").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                for pc in 0..12u8 {
+                    ui.selectable_value(&mut s.tonic, pc, pc_name(pc, sig_for(pc, s.scale)));
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if matches!(s.ex, Exercise::Scale | Exercise::Arpeggio | Exercise::LhSwell) {
+            ui.label(RichText::new("Octaves").small().strong());
+            ui.horizontal(|ui| {
+                for o in 1..=4u8 {
+                    ui.selectable_value(&mut s.octaves, o, o.to_string());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if matches!(s.ex, Exercise::Scale | Exercise::Arpeggio | Exercise::FiveFinger | Exercise::TriadInversions) {
+            ui.label(RichText::new("Pattern").small().strong());
+            egui::ComboBox::from_id_salt("pat").width(ui.available_width().min(320.0)).selected_text(s.pattern.label()).show_ui(ui, |ui| {
+                for p in Pattern::ALL {
+                    ui.selectable_value(&mut s.pattern, p, p.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex != Exercise::Rhythm {
+            ui.label(RichText::new("Hands").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                for m in Motion::ALL {
+                    ui.selectable_value(&mut s.motion, m, m.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if !matches!(s.ex, Exercise::Trill | Exercise::EtudeSeed | Exercise::TriadInversions | Exercise::Cadence) {
+            ui.label(RichText::new("Rhythm").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                for r in Rhythm::ALL {
+                    ui.selectable_value(&mut s.rhythm, r, r.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if matches!(s.ex, Exercise::Scale | Exercise::Arpeggio | Exercise::FiveFinger | Exercise::TriadInversions) {
+            ui.label(RichText::new("Accents / dynamics").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                for a in Accent::ALL {
+                    ui.selectable_value(&mut s.accent, a, a.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex == Exercise::Trill {
+            ui.label(RichText::new("Trill fingers").small().strong());
+            ui.horizontal(|ui| {
+                for pair in [(1, 2), (1, 3), (2, 3), (2, 4), (3, 4), (3, 5), (4, 5)] {
+                    ui.selectable_value(&mut s.trill_fingers, pair, format!("{}-{}", pair.0, pair.1));
+                }
+                ui.checkbox(&mut s.trill_half_step, "half step");
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex == Exercise::EtudeSeed {
+            ui.label(RichText::new("Seed").small().strong());
+            ui.horizontal(|ui| {
+                for k in 1..=3u32 {
+                    ui.selectable_value(&mut s.seed, k, seed_name(k));
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if s.ex == Exercise::Rhythm {
+            ui.label(RichText::new("Rhythm no.").small().strong());
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut s.seed).range(1..=999));
+                if ui.small_button("New rhythm").clicked() {
+                    s.seed += 1;
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if !matches!(s.ex, Exercise::EtudeSeed | Exercise::Rhythm) {
+            ui.label(RichText::new("Keys").small().strong());
+            egui::ComboBox::from_id_salt("cyc").width(ui.available_width().min(320.0)).selected_text(s.cycle.label()).show_ui(ui, |ui| {
+                for c in Cycle::ALL {
+                    ui.selectable_value(&mut s.cycle, c, c.label());
+                }
+            });
+            ui.add_space(6.0);
+        }
+    });
+    *s != before
 }

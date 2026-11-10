@@ -53,6 +53,11 @@ fn main() -> eframe::Result<()> {
                         r.pages, r.systems, r.measures, r.clean_measures, 100.0 * r.clean_measures as f64 / r.measures.max(1) as f64, r.notes,
                         p.key_name(), p.ts_num, p.ts_den, p.bar_count(),
                         p.notes.iter().filter(|n| n.hand == model::Hand::Right).count(), p.notes.iter().filter(|n| n.hand == model::Hand::Left).count());
+                    if let Some(src) = &p.src {
+                        for sct in &src.sections {
+                            println!("   § p.{} beat {:.1}–{:.1}: {}", sct.page, sct.beat, sct.end, sct.title);
+                        }
+                    }
                     if let Some(out) = args.get(3).filter(|a| !a.starts_with("--")) {
                         let _ = std::fs::write(out, serde_json::to_string(&p).unwrap_or_default());
                     }
@@ -79,7 +84,7 @@ fn main() -> eframe::Result<()> {
             while let Ok(m) = c.rx.recv() {
                 match m {
                     ui::convert::ConvMsg::Working { index, what } => println!("[{}/{}] {what}", index + 1, c.total),
-                    ui::convert::ConvMsg::Piece(p) => println!("   + {} ({} bars, {} notes) – {}", p.title, p.bar_count(), p.notes.len(), p.notes_text),
+                    ui::convert::ConvMsg::Piece(p, _) => println!("   + {} ({} bars, {} notes) – {}", p.title, p.bar_count(), p.notes.len(), p.notes_text),
                     ui::convert::ConvMsg::Skipped { pdf, why } => println!("   - skipped {}: {why}", pdf.display()),
                     ui::convert::ConvMsg::Finished => break,
                 }
@@ -127,6 +132,7 @@ fn main() -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon))
             .with_title("PianoCraft")
             .with_inner_size([1380.0, 900.0])
+            .with_maximized(true)
             .with_min_inner_size([900.0, 600.0])
             .with_drag_and_drop(true),
         ..Default::default()

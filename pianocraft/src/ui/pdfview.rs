@@ -139,6 +139,9 @@ pub struct BookView {
     pub notes: Annotations,
     drawing: Option<AStroke>,
     text_edit: Option<([f32; 2], String)>,
+    /// The bar being played, as fractions of the page: [left, top, right, bottom].
+    pub highlight: Option<[f32; 4]>,
+    last_scrolled: Option<[f32; 4]>,
 }
 
 pub const INK_COLORS: [(Color32, &str); 5] = [
@@ -165,6 +168,8 @@ impl BookView {
             notes: Annotations::load(),
             drawing: None,
             text_edit: None,
+            highlight: None,
+            last_scrolled: None,
         }
     }
 
@@ -258,16 +263,17 @@ impl BookView {
         changed
     }
 
-    /// Draw the page filling `ui`'s available area.
-    pub fn show(&mut self, ui: &mut Ui) {
+    /// Draw the page filling `ui`'s available area. Returns where the page was clicked with the
+    /// Look tool (fractions of the page), so a click on a bar can jump the music there.
+    pub fn show(&mut self, ui: &mut Ui) -> Option<[f32; 2]> {
         self.poll(ui.ctx());
         let Some(path) = self.path.clone() else {
             ui.label("No book open.");
-            return;
+            return None;
         };
         if let Some(e) = &self.error {
             ui.colored_label(Color32::LIGHT_RED, format!("Couldn't open this PDF: {e}"));
-            return;
+            return None;
         }
         let avail = ui.available_width() - 14.0;
         let ppp = ui.ctx().pixels_per_point();
@@ -286,17 +292,35 @@ impl BookView {
         }
         let Some((_, shown_page, _, tex)) = self.tex.clone() else {
             ui.spinner();
-            return;
+            return None;
         };
+        let mut clicked = None;
         let size = tex.size_vec2();
         let w = disp_w;
         let h = w * size.y / size.x;
         let key = Annotations::key(&path, shown_page);
         egui::ScrollArea::both().id_salt("bookscroll").auto_shrink([false, false]).show(ui, |ui| {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), if self.tool == Tool::Look { Sense::hover() } else { Sense::click_and_drag() });
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), if self.tool == Tool::Look { Sense::click() } else { Sense::click_and_drag() });
             ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             let to_norm = |p: Pos2| [((p.x - rect.left()) / rect.width()), ((p.y - rect.top()) / rect.height())];
             let from_norm = |n: [f32; 2]| Pos2::new(rect.left() + n[0] * rect.width(), rect.top() + n[1] * rect.height());
+            // the bar being played
+            if shown_page == self.page {
+                if let Some(hl) = self.highlight {
+                    let r = Rect::from_min_max(from_norm([hl[0], hl[1]]), from_norm([hl[2], hl[3]]));
+                    ui.painter().rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(255, 200, 40, 50));
+                    ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, Color32::from_rgba_unmultiplied(230, 150, 0, 200)), egui::StrokeKind::Inside);
+                    // keep it in view when it moves to another line
+                    let moved_line = self.last_scrolled.is_none_or(|l| (l[1] - hl[1]).abs() > 0.01);
+                    if moved_line {
+                        ui.scroll_to_rect(r.expand(30.0), Some(egui::Align::Center));
+                        self.last_scrolled = Some(hl);
+                    }
+                }
+            }
+            if self.tool == Tool::Look && resp.clicked() {
+                clicked = resp.interact_pointer_pos().map(to_norm);
+            }
             let pn = self.notes.pages.entry(key.clone()).or_default();
             // interactions
             let mut dirty = false;
@@ -397,6 +421,7 @@ impl BookView {
                 ui.ctx().request_repaint();
             }
         });
+        clicked
     }
 }
 
@@ -416,49 +441,4 @@ pub fn find_audiveris(configured: &str) -> Option<PathBuf> {
     }
     c.push(PathBuf::from("/opt/audiveris/bin/Audiveris"));
     c.into_iter().find(|p| p.exists())
-}
-
-pub enum OmrMsg {
-    Done { pdf: PathBuf, page: usize, files: Vec<PathBuf> },
-    Failed { msg: String },
-}
-
-/// Run Audiveris on one page in the background. Results arrive on the returned channel.
-pub fn convert_page(audiveris: PathBuf, pdf: PathBuf, page: usize) -> Receiver<OmrMsg> {
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
-        let stem = pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("book").chars().filter(|c| c.is_alphanumeric()).take(24).collect::<String>();
-        let out = data_dir().join("converted").join(format!("{stem}-p{page}"));
-        let _ = std::fs::remove_dir_all(&out);
-        let _ = std::fs::create_dir_all(&out);
-        let mut cmd = std::process::Command::new(&audiveris);
-        cmd.arg("-batch").arg("-export").arg("-output").arg(&out).arg("-sheets").arg(page.to_string()).arg("--").arg(&pdf);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // no console window
-        }
-        let res = cmd.output();
-        let mut files = vec![];
-        fn walk(d: &Path, out: &mut Vec<PathBuf>) {
-            if let Ok(rd) = std::fs::read_dir(d) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else if p.extension().is_some_and(|x| x == "mxl" || x == "musicxml" || x == "xml") {
-                        out.push(p);
-                    }
-                }
-            }
-        }
-        walk(&out, &mut files);
-        files.sort();
-        let _ = match res {
-            Ok(_) if !files.is_empty() => tx.send(OmrMsg::Done { pdf, page, files }),
-            Ok(o) => tx.send(OmrMsg::Failed { msg: format!("Audiveris didn't produce any music for this page. {}", String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("")) }),
-            Err(e) => tx.send(OmrMsg::Failed { msg: format!("Couldn't run Audiveris: {e}") }),
-        };
-    });
-    rx
 }

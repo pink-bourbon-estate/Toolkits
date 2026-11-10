@@ -74,9 +74,88 @@ pub struct Piece {
     /// Key changes after the start: (beat, fifths). Used by exercises that travel through keys.
     #[serde(default)]
     pub key_changes: Vec<(f64, i32)>,
+    /// Where the music is in your PDF (pages, bar positions, exercises), when it came from one.
+    #[serde(default)]
+    pub src: Option<SourceMap>,
+}
+
+/// One bar's place in the PDF.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BarMark {
+    pub beat: f64,
+    /// 1-based PDF page.
+    pub page: u32,
+    /// The bar on the page as fractions of the page size: [left, top, right, bottom].
+    #[serde(default)]
+    pub rect: Option<[f32; 4]>,
+    /// Time signature in force.
+    #[serde(default)]
+    pub ts: (u32, u32),
+}
+
+/// An exercise or piece inside a PDF (from its heading).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Section {
+    pub beat: f64,
+    pub end: f64,
+    pub page: u32,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SourceMap {
+    pub pdf: String,
+    pub bars: Vec<BarMark>,
+    #[serde(default)]
+    pub sections: Vec<Section>,
 }
 
 impl Piece {
+    /// The PDF page (and bar position on it) being played at `beat`.
+    pub fn page_at(&self, beat: f64) -> Option<(u32, Option<[f32; 4]>)> {
+        let src = self.src.as_ref()?;
+        let m = src.bars.iter().take_while(|m| m.beat <= beat + 1e-6).last().or(src.bars.first())?;
+        Some((m.page, m.rect))
+    }
+
+    /// The bar whose box on `page` contains the point (fractions of the page), as its start beat.
+    pub fn beat_at_point(&self, page: u32, x: f32, y: f32) -> Option<f64> {
+        let src = self.src.as_ref()?;
+        src.bars.iter().find(|m| m.page == page && m.rect.is_some_and(|r| x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3])).map(|m| m.beat)
+    }
+
+    /// A stretch of this piece (beats a..b) as a piece of its own, starting at beat 0.
+    pub fn slice(&self, a: f64, b: f64, id: String, title: String) -> Piece {
+        let notes: Vec<Note> = self
+            .notes
+            .iter()
+            .filter(|n| n.start >= a - 1e-6 && n.start < b - 1e-6)
+            .map(|n| Note { start: n.start - a, dur: n.dur.min(b - n.start).max(0.05), ..n.clone() })
+            .collect();
+        let src = self.src.as_ref().map(|s| SourceMap {
+            pdf: s.pdf.clone(),
+            bars: s.bars.iter().filter(|m| m.beat >= a - 1e-6 && m.beat < b - 1e-6).map(|m| BarMark { beat: m.beat - a, ..m.clone() }).collect(),
+            sections: vec![],
+        });
+        let ts = src.as_ref().and_then(|s| s.bars.first()).map(|m| m.ts).filter(|t| t.0 > 0).unwrap_or((self.ts_num, self.ts_den));
+        Piece {
+            id,
+            title,
+            composer: self.composer.clone(),
+            notes_text: self.notes_text.clone(),
+            bpm: self.bpm,
+            ts_num: ts.0,
+            ts_den: ts.1,
+            key_fifths: self.key_at(a),
+            minor: self.minor,
+            pickup: 0.0,
+            notes,
+            origin: self.origin.clone(),
+            key_changes: self.key_changes.iter().filter(|k| k.0 > a + 1e-6 && k.0 < b - 1e-6).map(|k| (k.0 - a, k.1)).collect(),
+            src,
+        }
+    }
+
     pub fn bar_len(&self) -> f64 {
         self.ts_num as f64 * 4.0 / self.ts_den as f64
     }

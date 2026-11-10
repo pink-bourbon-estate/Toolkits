@@ -132,6 +132,7 @@ pub fn import_midi(bytes: &[u8], title: &str) -> Result<Piece, String> {
         notes: all,
         origin: Origin::BuiltIn,
         key_changes: vec![],
+        src: None,
     })
 }
 
@@ -379,6 +380,7 @@ pub fn import_musicxml(xml: &str, fallback_title: &str) -> Result<Piece, String>
         notes,
         origin: Origin::BuiltIn,
         key_changes: vec![],
+        src: None,
     })
 }
 

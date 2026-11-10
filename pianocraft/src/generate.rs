@@ -901,6 +901,7 @@ pub fn generate(spec: &TechSpec) -> Piece {
         notes: std::mem::take(&mut b.notes),
         origin: Origin::Generated,
         key_changes: b.key_changes,
+        src: None,
     };
     p.sort_notes();
     p

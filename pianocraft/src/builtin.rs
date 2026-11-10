@@ -35,6 +35,7 @@ fn build(d: &Def) -> Piece {
         notes,
         origin: Origin::BuiltIn,
         key_changes: vec![],
+        src: None,
     };
     p.sort_notes();
     p

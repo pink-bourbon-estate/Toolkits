@@ -17,28 +17,35 @@ PianoCraft checks for a newer build when it starts (at most every 6 hours). When
 The only network requests are anonymous downloads from github.com. No account, no telemetry, nothing about you is sent.
 
 ## What's in it
-- **Today**: your course, the Russian School of Piano Playing chapter by chapter from 1a chapter V (quavers) through the end of 1b, with Nahre Sol's approach alongside.
-  - Each unit lists the book's own numbered pieces. **Practise** opens your copy at the right page and walks you through the Russian-School steps (listen and sing, count and clap, RH, LH, hands together, learn by heart, up to tempo, transpose) with a metronome and repetition counter. **Too hard** makes the step smaller; **Nailed it** moves you on.
-  - Each unit also has simplified versions of Nahre Sol's exercises (circling scales, left-hand swells, turnaround chains, ii-V-I warm-ups, measured trills, Chopin seeds) with a button to her full version in your PDFs, plus a theory page from *Elements of Music* and an ear/creative task.
-- **Books**: your PDFs inside the app. Annotate with pen, highlighter, text and finger-number stamps. Notes are saved per page and the PDFs are never changed.
-- **Make PDFs playable**: PianoCraft reads typeset sheet music (PDFs made by MuseScore, Sibelius, Dorico, Finale or LilyPond) by itself, a whole book in a second or two: notes, rhythms, ties, beams, triplets, key and time changes, 8va lines, clef changes, and guitar scores (moved down an octave, with bass and tune split between the hands). Bars that don't add up exactly are flagged, so compare those with the page. Scanned books (photos of pages) go through the free Audiveris program instead. Use **Make this page playable** for one page, **📚 Whole book** for a whole book, or Library → **Make all PDFs playable** for a whole folder (several folders separated by `;`). PDFs that aren't music are skipped, and your files are only ever read, never changed.
-- **Practice**: sheet music plus falling notes, tempo, metronome, count-in, repeat ×N, drag to loop bars, simplify either hand, change key or **Easiest key**, and **Peek** for memory work.
-- **Keyboard**: 61, 76 or 88 keys. Zoom and the scroll strip move around it, and it follows the music. Names are on every key, including C♯/D♭ on the black keys.
-- **Scales & technique**: 16 scales and modes (major, three minors, seven modes, pentachords, pentatonics, blues, whole tone, chromatic) in 1-4 octaves.
-  - Exercise types: five-finger, scale, arpeggio (eight chord types), triad inversions, cadence, progressions (ii-V-I, I-IV-V-I, turnarounds), measured trills, LH swells, Chopin seeds and rhythm reading.
-  - Patterns: straight, broken thirds, groups of 3 and 4, circling, turnaround and rising fragments.
-  - Hands: either hand alone, together one or two octaves apart, a tenth apart, or contrary motion.
-  - Seven rhythms, accents, crescendo-diminuendo, and key chains (fifths, fourths, whole tones, minor thirds, chromatic).
-  - Fingering is automatic and matches the standard tables.
-- **Note reading**: Nahre Sol's landmark method in four levels. Answer on screen or on your piano.
-- **Difficulty slider** (Practice, like a rhythm game): 1 = just the tune on the main beats, 2 = the whole tune, 3 = + held bass notes, 4 = + bass line, 5 = tune with one harmony note, 6 = full right hand, 7 = everything. Works on every piece, including your imports.
-- **Repertoire**: 55 graded pieces built in (Grade 1–8, Mutopia Project, public domain / CC BY-SA). Includes all the Anna Magdalena minuets and polonaises, Schumann *Album for the Young*, Tchaikovsky *Children's Album*, Burgmüller Op. 100, Czerny, Handel, Clementi, Für Elise, Bach's C major Prelude and Inventions, Satie, Joplin, Chopin preludes and waltz, *Träumerei*, *Moonlight* (I), Debussy's Arabesque No. 1 and Clair de lune. Credits are in `repertoire/LICENSES.md`.
-- **Library / Find music**: import MIDI and MusicXML, and search free sources.
+One screen. On the left is a list of everything you can practise; on the right is whatever you opened. At the top is the path to it (for example *Russian School 1a › p.25 › 47. The Wind Blew on the Sea*), where you can click any part to go back, and **◀ ▶** for the previous and next exercise. **Settings** is the only other tab.
+
+- **Course**: the Russian School of Piano Playing from the very start of 1a (singing by ear, notes and the stave) to the end of 1b, chapter by chapter, with Nahre Sol's approach alongside.
+  - Each chapter lists the book's numbered pieces and a short plan: warm-ups, theory pages from *Elements of Music*, and an ear task.
+  - **Practise** walks you through the Russian-School steps: listen and sing, count and clap, right hand, left hand, hands together, learn by heart, up to tempo, transpose. **Too hard** makes the step smaller and **Nailed it** moves you on. **I know this whole chapter** skips what you can already play.
+- **Books & sheet music**: every PDF in your music folders, grouped by folder. Each opens as book › page › the exercises on that page.
+  - Typeset sheet music (PDFs from MuseScore, Sibelius, Dorico or Finale) is read by PianoCraft itself in a second or two: notes, rhythms, beams, triplets, key and time changes, 8va lines, clef changes, and guitar scores (moved down an octave, with bass and tune split between the hands).
+  - The exercises inside a book are found from their headings (e.g. *EXERCISE NO. 3B*, *5. Left Hand Swells*, *II: Michishirube*).
+  - Scanned books need the free Audiveris program; PianoCraft runs it on a page by itself the first time you open a piece on it.
+  - Once a page is playable, it stays playable.
+  - Annotate any page with pen, highlighter, text and finger numbers. Your PDFs are never changed.
+- **Playing along**: the book page sits beside the sheet music and falling notes.
+  - The page turns by itself and the bar being played is highlighted. Click a bar on the page to jump there.
+  - Tempo, metronome, count-in, repeat ×N, drag to loop bars, either hand alone, change key or **Easiest key**, and **Peek** for memory work.
+  - **Difficulty slider**, like a rhythm game: 1 = just the tune on the main beats, 2 = the whole tune, 3 = + held bass notes, 4 = + bass line, 5 = tune with one harmony note, 6 = full right hand, 7 = everything. It works on every piece.
+- **Keyboard**: 61, 76 or 88 keys, with zoom and a scroll strip, following the music. Names are on every key, including C♯/D♭.
+- **Scales & technique**: the settings sit beside the music and change it straight away.
+  - 16 scales and modes in 1–4 octaves.
+  - Exercises: five-finger, scale, arpeggio (eight chord types), triad inversions, cadence, ii–V–I and other progressions, measured trills, left-hand swells, Chopin seeds, rhythm reading.
+  - 7 patterns, 6 ways for the hands, 7 rhythms, accents, and chains through keys.
+  - Fingering is automatic.
+- **Note reading**: Nahre Sol's landmark method in four levels. A wrong answer explains which clef the note was in.
+- **Repertoire**: 55 graded pieces built in (Grade 1–8, Mutopia Project, public domain / CC BY-SA, credits in `repertoire/LICENSES.md`), up to Clair de lune.
+- **Your files**: drop MIDI or MusicXML onto the window. **Find music** searches free sources.
 
 ## Making scanned books playable (Audiveris)
 Only needed for scans. Typeset PDFs are read by PianoCraft itself.
 1. Install Audiveris, free from https://github.com/Audiveris/audiveris/releases. Use the Windows **.msi** installer under *Assets*, not the source code.
-2. In PianoCraft, press **Make this page playable** (about a minute) or **📚 Whole book** (runs in the background).
+2. Open any piece in the book. PianoCraft makes its page playable in the background (about a minute) and switches to sound when it's done.
 3. Old scans can have recognition mistakes, so compare with the page.
 
 ## Built-in pieces
@@ -80,7 +87,8 @@ The engine is kept below the UI, the same layering as EffectCraft.
 - `books`: where each Russian School piece is in your PDFs.
 - `ui/pdfview`: the book viewer and annotations (hayro, as in PdfCraft), plus Audiveris.
 - `ui/reading`: the note-reading trainer.
-- `ui/`: the egui front end (app, falling notes and keyboard, staff).
+- `ui/app/workspace`: the one practice screen (browser, path, player, page following).
+- `ui/`: the rest of the egui front end (app, falling notes and keyboard, staff).
 
 License: MIT OR Apache-2.0.
 
