@@ -8,6 +8,7 @@ use crate::midi_in::MidiIn;
 use crate::model::{key_name, transpose_key, Hand, Note, Origin, Piece};
 use crate::transform::{arrange, easiest_transposition, rate, Arrangement, LhMode, RhMode};
 use crate::ui::falling::{falling_notes, keyboard, FallingOpts, KeyNames, KeyView, KeyboardOpts, KEYBOARDS, LH_COLOR, RH_COLOR};
+use crate::ui::convert::{self, ConvMsg, Converter, Job};
 use crate::ui::pdfview::{convert_page, find_audiveris, BookView, OmrMsg};
 use crate::ui::reading::{self, Trainer};
 use crate::ui::staff::{staff, StaffOpts};
@@ -104,6 +105,14 @@ pub struct App {
     current_book: Option<BookId>,
     omr_rx: Option<Receiver<OmrMsg>>,
     omr_status: String,
+    conv: Option<Converter>,
+    /// Folder conversions: also send scanned books to Audiveris (slow).
+    conv_scans: bool,
+    /// Convert again even if a PDF is already in the Library.
+    conv_redo: bool,
+    /// Open the result when this single-page conversion finishes.
+    conv_open: bool,
+    scanned_once: bool,
     pending_link: Option<PendingLink>,
     trainer: Trainer,
     prev_pressed: HashSet<u8>,
@@ -203,6 +212,11 @@ impl App {
             current_book: None,
             omr_rx: None,
             omr_status: String::new(),
+            conv: None,
+            conv_scans: false,
+            conv_redo: false,
+            conv_open: false,
+            scanned_once: false,
             pending_link: None,
             trainer: Trainer::new(0),
             prev_pressed: HashSet::new(),
@@ -512,6 +526,7 @@ impl App {
                     self.msg = format!("Imported '{}' – difficulty {:.1}/10. Find it in the Library.", p.title, d.score);
                     self.progress.library.retain(|x| x.id != p.id);
                     self.progress.library.push(p);
+                    self.progress.library_changed();
                     self.progress.save();
                 }
                 Err(e) => self.msg = format!("{}: {e}", path.display()),
@@ -520,6 +535,15 @@ impl App {
     }
 
     fn start_omr(&mut self, book: Option<BookId>, pdf: PathBuf, page: usize) {
+        self.current_book = book.or(self.current_book);
+        // The Russian School books are scans whose pieces get linked to the course, so they keep
+        // the page-by-page Audiveris route. Everything else goes through the converter, which reads
+        // typeset PDFs itself in a second and only uses Audiveris for scans.
+        if !matches!(book, Some(BookId::RussianSchool1a | BookId::RussianSchool1b)) {
+            self.conv_open = true;
+            self.start_convert(vec![Job { pdf, pages: Some((page, page)) }], true);
+            return;
+        }
         let Some(exe) = find_audiveris(&self.progress.audiveris) else {
             self.msg = format!("Audiveris isn't installed yet. It's free: download the Windows installer from {AUDIVERIS_URL}, install it, then press this button again. (Settings → Make pages playable has details.)");
             self.tab = Tab::Settings;
@@ -528,6 +552,83 @@ impl App {
         self.omr_status = format!("Reading page {page} with Audiveris… this takes about a minute.");
         self.omr_rx = Some(convert_page(exe, pdf, page));
         self.current_book = book.or(self.current_book);
+    }
+
+    /// Convert PDFs in the background. `scans`: send scanned books to Audiveris if installed.
+    fn start_convert(&mut self, jobs: Vec<Job>, scans: bool) {
+        if self.conv.as_ref().is_some_and(|c| !c.finished) {
+            self.msg = "Already converting – wait for it to finish, or press Stop.".into();
+            return;
+        }
+        if jobs.is_empty() {
+            self.msg = "Nothing to convert – those PDFs are already in your Library (tick 'convert again' to redo them).".into();
+            return;
+        }
+        let exe = if scans { find_audiveris(&self.progress.audiveris) } else { None };
+        self.conv = Some(convert::start(jobs, exe));
+    }
+
+    /// Already converted from this PDF?
+    fn converted_from(&self, pdf: &std::path::Path) -> bool {
+        let s = pdf.display().to_string();
+        self.progress.library.iter().any(|p| matches!(&p.origin, Origin::Imported(o) if *o == s) && p.id.starts_with("pdf-"))
+    }
+
+    fn poll_convert(&mut self) {
+        let Some(c) = self.conv.as_mut() else { return };
+        let mut changed = false;
+        let mut last_piece: Option<Piece> = None;
+        while let Ok(m) = c.rx.try_recv() {
+            match m {
+                ConvMsg::Working { index, what } => {
+                    c.index = index;
+                    c.what = what;
+                }
+                ConvMsg::Piece(p) => {
+                    c.made += 1;
+                    self.progress.library.retain(|x| x.id != p.id);
+                    last_piece = Some((*p).clone());
+                    self.progress.library.push(*p);
+                    changed = true;
+                }
+                ConvMsg::Skipped { pdf, why } => c.skipped.push((pdf, why)),
+                ConvMsg::Finished => {
+                    c.finished = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.progress.library_changed();
+        if c.finished || c.made % 10 == 0 {
+            self.progress.save();
+        }
+        if c.finished {
+            let (made, total, skipped) = (c.made, c.total, c.skipped.clone());
+            if total == 1 && made == 0 {
+                self.msg = format!("Couldn't make that playable: {}.", skipped.first().map(|s| s.1.as_str()).unwrap_or("no notes found"));
+            } else if total == 1 {
+                self.msg = String::new();
+            } else {
+                self.msg = format!(
+                    "Finished: {made} playable piece{} from {total} PDF{}{}. They're in the Library under 'Your imports'.",
+                    if made == 1 { "" } else { "s" },
+                    if total == 1 { "" } else { "s" },
+                    if skipped.is_empty() { String::new() } else { format!("; {} skipped (see the list in Library)", skipped.len()) }
+                );
+            }
+            if self.conv_open {
+                self.conv_open = false;
+                if let Some(p) = last_piece {
+                    let note = p.notes_text.clone();
+                    self.open_piece(p, false, None);
+                    self.tab = Tab::Practice;
+                    self.msg = note;
+                }
+            }
+        }
     }
 
     fn poll_omr(&mut self) {
@@ -557,6 +658,7 @@ impl App {
                             parts.push((p.id.clone(), format!("{} bars, starts {}", p.bar_count(), first.join(" "))));
                             self.progress.library.retain(|x| x.id != p.id);
                             self.progress.library.push(p);
+                            self.progress.library_changed();
                         }
                     }
                 }
@@ -610,8 +712,9 @@ impl eframe::App for App {
             self.progress.save();
         }
         self.poll_omr();
+        self.poll_convert();
         self.poll_updates(ctx);
-        if self.omr_rx.is_some() {
+        if self.omr_rx.is_some() || self.conv.as_ref().is_some_and(|c| !c.finished) {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
@@ -657,6 +760,29 @@ impl eframe::App for App {
             ui.add_space(2.0);
         });
 
+        if self.conv.as_ref().is_some_and(|c| !c.finished) {
+            let mut stop = false;
+            egui::TopBottomPanel::bottom("conv").show(ctx, |ui| {
+                let c = self.conv.as_ref().unwrap();
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let of = if c.total > 1 { format!("{} of {} · ", c.index + 1, c.total) } else { String::new() };
+                    ui.label(RichText::new(format!("{of}{}", c.what)).color(Color32::from_rgb(250, 220, 120)));
+                    if c.total > 1 {
+                        ui.add(egui::ProgressBar::new(c.index as f32 / c.total as f32).desired_width(160.0));
+                        ui.label(format!("{} made, {} skipped", c.made, c.skipped.len()));
+                    }
+                    if ui.button("Stop").clicked() {
+                        stop = true;
+                    }
+                });
+            });
+            if stop {
+                if let Some(c) = &self.conv {
+                    c.cancel();
+                }
+            }
+        }
         if !self.msg.is_empty() || !self.omr_status.is_empty() {
             egui::TopBottomPanel::bottom("msg").show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1062,8 +1188,11 @@ impl App {
             });
             if let Some(path) = self.bookview.path.clone() {
                 let page = self.bookview.page;
-                if ui.button("🔊 Make this page playable").on_hover_text("Uses Audiveris to read the notes").clicked() {
-                    self.start_omr(self.current_book, path, page);
+                if ui.button("🔊 Make this page playable").on_hover_text("Typeset PDFs are read instantly; scanned pages use Audiveris").clicked() {
+                    self.start_omr(self.current_book, path.clone(), page);
+                }
+                if ui.button("📚 Whole book").on_hover_text("Make every page playable in one go. Typeset PDFs take seconds; scanned books take about a minute per page with Audiveris, in the background.").clicked() {
+                    self.start_convert(vec![Job { pdf: path, pages: None }], true);
                 }
             }
         });
@@ -1599,27 +1728,61 @@ impl App {
                 self.import_paths(vec![p]);
             }
         });
-        ui.collapsing("📁 Your piano folder", |ui| {
+        egui::CollapsingHeader::new("📁 Your music folders").default_open(true).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.progress.scan_folder).desired_width(460.0));
-                if ui.button("Scan").clicked() {
-                    self.scan_results = scan(&PathBuf::from(&self.progress.scan_folder));
+                ui.add(egui::TextEdit::singleline(&mut self.progress.scan_folder).desired_width(460.0).hint_text(r"C:\Music\Piano; C:\Music\Guitar"));
+                let first = !self.scanned_once && !self.progress.scan_folder.trim().is_empty();
+                if ui.button("Scan").clicked() || first {
+                    self.scanned_once = true;
+                    self.scan_results = self.progress.scan_folder.split(';').map(str::trim).filter(|f| !f.is_empty()).flat_map(|f| scan(&PathBuf::from(f.trim_matches('"')))).collect();
                     self.msg = format!("Found {} music files.", self.scan_results.len());
                     self.progress.save();
                 }
             });
-            ui.label(RichText::new("MIDI/MusicXML import straight in. PDFs open in the book viewer, where 'Make this page playable' converts a page with Audiveris.").small().weak());
+            ui.label(RichText::new("Several folders: separate them with ;  (your guitar folder works too – guitar music is moved down to where a guitar sounds and split between the hands).").small().weak());
+            let pdfs: Vec<PathBuf> = self.scan_results.iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))).cloned().collect();
+            if !pdfs.is_empty() {
+                let todo: Vec<PathBuf> = pdfs.iter().filter(|p| self.conv_redo || !self.converted_from(p)).cloned().collect();
+                ui.horizontal(|ui| {
+                    let busy = self.conv.as_ref().is_some_and(|c| !c.finished);
+                    if ui.add_enabled(!busy && !todo.is_empty(), egui::Button::new(RichText::new(format!("🔊 Make all {} PDFs playable", todo.len())).strong())).on_hover_text("Typeset sheet music (MuseScore, Sibelius, Dorico, Finale…) is read in seconds. PDFs that aren't music are skipped and never changed.").clicked() {
+                        let jobs = todo.iter().map(|p| Job { pdf: p.clone(), pages: None }).collect();
+                        self.start_convert(jobs, self.conv_scans);
+                    }
+                    ui.checkbox(&mut self.conv_scans, "include scanned books").on_hover_text("Scans (pictures of pages) go through Audiveris, about a minute per page – a whole book can take an hour or more. It runs in the background.");
+                    ui.checkbox(&mut self.conv_redo, "convert again");
+                });
+                if self.conv_scans && find_audiveris(&self.progress.audiveris).is_none() {
+                    ui.label(RichText::new("Audiveris isn't installed, so scanned books will be skipped (Settings → Make pages playable).").small().color(Color32::from_rgb(250, 200, 120)));
+                }
+            }
+            if let Some(c) = &self.conv {
+                if c.finished && !c.skipped.is_empty() {
+                    ui.collapsing(format!("Skipped last time ({})", c.skipped.len()), |ui| {
+                        egui::ScrollArea::vertical().id_salt("skipped").max_height(140.0).show(ui, |ui| {
+                            for (p, why) in &c.skipped {
+                                ui.label(RichText::new(format!("{} – {why}", p.file_name().and_then(|n| n.to_str()).unwrap_or("?"))).small());
+                            }
+                        });
+                    });
+                }
+            }
             let mut to_import = vec![];
             let mut to_open = None;
+            let mut to_convert: Vec<PathBuf> = vec![];
             egui::ScrollArea::vertical().id_salt("scan").max_height(220.0).show(ui, |ui| {
                 for p in &self.scan_results {
                     ui.horizontal(|ui| {
                         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                         if ext == "pdf" {
-                            ui.label(RichText::new(format!("📄 {name}")).weak());
+                            let done = self.progress.library.iter().any(|x| matches!(&x.origin, Origin::Imported(o) if *o == p.display().to_string()) && x.id.starts_with("pdf-"));
+                            ui.label(RichText::new(format!("{} {name}", if done { "✅" } else { "📄" })).weak());
                             if ui.small_button("open").clicked() {
                                 to_open = Some(p.clone());
+                            }
+                            if !done && ui.small_button("make playable").clicked() {
+                                to_convert.push(p.clone());
                             }
                         } else {
                             ui.label(format!("🎵 {name}"));
@@ -1632,6 +1795,10 @@ impl App {
             });
             if !to_import.is_empty() {
                 self.import_paths(to_import);
+            }
+            if !to_convert.is_empty() {
+                let jobs = to_convert.into_iter().map(|p| Job { pdf: p, pages: None }).collect();
+                self.start_convert(jobs, true);
             }
             if let Some(p) = to_open {
                 self.current_book = BookId::ALL.iter().copied().find(|b| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| b.matches(n)));
@@ -1714,6 +1881,7 @@ impl App {
         }
         if let Some(id) = remove {
             self.progress.library.retain(|p| p.id != id);
+            self.progress.library_changed();
             self.progress.book_links.retain(|_, v| *v != id);
             self.progress.save();
         }
@@ -1959,7 +2127,7 @@ impl App {
 
     fn ui_find(&mut self, ui: &mut egui::Ui) {
         ui.heading("Find music");
-        ui.label("Search free, legal sources. Download a MIDI (.mid) or MusicXML (.mxl / .musicxml) file and drag it onto this window. PianoCraft rates it, splits the hands and builds easier versions. Got a PDF instead? Open it in Books and use 'Make this page playable'.");
+        ui.label("Search free, legal sources. Download a MIDI (.mid) or MusicXML (.mxl / .musicxml) file and drag it onto this window. PianoCraft rates it, splits the hands and builds easier versions. Got a PDF instead? Library → 'Make all PDFs playable' reads typeset sheet music straight from the PDF.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label("Song or composer:");
@@ -2078,7 +2246,7 @@ impl App {
                 ui.label("Audiveris is a free program that reads printed music and turns it into notes. Install it once; then any book page can be heard, slowed down, looped and shown as falling notes.");
                 ui.label("1. Download the Windows installer (.msi) from the Audiveris releases page and install it.");
                 ui.label("2. Come back here – PianoCraft finds it automatically (or paste the path to Audiveris.exe below).");
-                ui.label("3. On any book page press 'Make this page playable'. It takes about a minute per page. Old scans can have mistakes – compare with the page.");
+                ui.label("3. On any book page press 'Make this page playable' (about a minute per page) or '📚 Whole book' (runs in the background). Old scans can have mistakes – compare with the page. Typeset PDFs (MuseScore, Sibelius, Dorico…) don't need Audiveris at all.");
                 ui.horizontal(|ui| {
                     if ui.button("Open the Audiveris download page ↗").clicked() {
                         let _ = webbrowser::open(AUDIVERIS_URL);

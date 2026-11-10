@@ -13,7 +13,7 @@
 
 use crate::model::{Hand, Note, Origin, Piece};
 use hayro::hayro_interpret::font::GlyphRun;
-use hayro::hayro_interpret::kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
+use hayro::hayro_interpret::kurbo::{Affine, BezPath, PathEl, Point, Rect};
 use hayro::hayro_interpret::{
     interpret_page, BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask,
 };
@@ -51,14 +51,21 @@ pub enum Sym {
     CutTime,
     TupletDigit(u8),
     Eight, // small "8" under a clef (guitar treble clef)
+    /// start of an 8va (+12) / 8vb (-12) line
+    Ottava(i8),
 }
 
 /// SMuFL code point → symbol.
 fn smufl(c: u32) -> Option<Sym> {
     Some(match c {
-        0xE0A2 | 0xE0A0 => Sym::HeadWhole,
-        0xE0A3 => Sym::HeadHalf,
-        0xE0A4 => Sym::HeadBlack,
+        0xE0A2 | 0xE0A0 | 0xF4BC => Sym::HeadWhole,
+        0xE0A3 | 0xF4BD => Sym::HeadHalf,
+        // Bravura's optional (Dorico) notehead and clef forms live at U+F4xx
+        0xE0A4 | 0xF4BE => Sym::HeadBlack,
+        0xF472 => Sym::ClefG,
+        0xF474 => Sym::ClefF,
+        0xE510 | 0xE511 => Sym::Ottava(12),
+        0xE512 | 0xE51C => Sym::Ottava(-12),
         0xE050 | 0xE07A => Sym::ClefG,
         0xE052 => Sym::ClefG, // gClef8vb handled via flag below
         0xE062 | 0xE07C => Sym::ClefF,
@@ -113,6 +120,7 @@ fn mac_roman(c: char) -> Option<u8> {
         '·' => 0xE1,
         'Î' => 0xEB,
         '¥' => 0xB4,
+        '“' => 0xD2,
         _ => return None,
     })
 }
@@ -144,6 +152,7 @@ fn sonata(b: u8) -> Option<Sym> {
         b'0'..=b'9' => Sym::TimeDigit(b - b'0'),
         b'c' => Sym::CommonTime,
         b'C' => Sym::CutTime,
+        0xD2 => Sym::Ottava(12), // Sibelius "8va"
         _ => return None,
     })
 }
@@ -176,25 +185,56 @@ pub struct PageMarks {
     pub fills: Vec<(Rect, Vec<Point>)>,
     pub width: f64,
     pub height: f64,
+    /// Number of pictures on the page (a scanned page is one big picture).
+    pub images: usize,
 }
 
 struct Collector<'m> {
     m: &'m mut PageMarks,
 }
 
-fn flatten(path: &BezPath, t: Affine) -> Vec<Vec<Point>> {
+/// Flatten a path into polylines; the flag says whether the piece contained curves
+/// (slurs, ties, noteheads drawn as outlines…), which must never be taken for straight lines.
+fn flatten(path: &BezPath, t: Affine) -> Vec<(Vec<Point>, bool)> {
     let mut out = vec![];
     let mut cur: Vec<Point> = vec![];
+    let mut curved = false;
+    let mut last = Point::ZERO;
     for el in path.elements() {
         match el {
             PathEl::MoveTo(p) => {
                 if cur.len() > 1 {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), curved));
                 }
                 cur = vec![t * *p];
+                curved = false;
+                last = *p;
             }
-            PathEl::LineTo(p) => cur.push(t * *p),
-            PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => cur.push(t * *p),
+            PathEl::LineTo(p) => {
+                cur.push(t * *p);
+                last = *p;
+            }
+            PathEl::QuadTo(c, p) => {
+                for k in 1..=8 {
+                    let u = k as f64 / 8.0;
+                    let q = last.lerp(*c, u).lerp(c.lerp(*p, u), u);
+                    cur.push(t * q);
+                }
+                curved = true;
+                last = *p;
+            }
+            PathEl::CurveTo(c1, c2, p) => {
+                for k in 1..=8 {
+                    let u = k as f64 / 8.0;
+                    let a = last.lerp(*c1, u);
+                    let b = c1.lerp(*c2, u);
+                    let c = c2.lerp(*p, u);
+                    let q = a.lerp(b, u).lerp(b.lerp(c, u), u);
+                    cur.push(t * q);
+                }
+                curved = true;
+                last = *p;
+            }
             PathEl::ClosePath => {
                 if let Some(f) = cur.first().copied() {
                     cur.push(f);
@@ -203,7 +243,7 @@ fn flatten(path: &BezPath, t: Affine) -> Vec<Vec<Point>> {
         }
     }
     if cur.len() > 1 {
-        out.push(cur);
+        out.push((cur, curved));
     }
     out
 }
@@ -216,9 +256,10 @@ impl<'a> Device<'a> for Collector<'_> {
             DrawMode::Stroke(s) | DrawMode::FillAndStroke(_, s) => Some(s.line_width as f64 * scale),
             _ => None,
         };
-        for poly in flatten(path, t) {
+        for (poly, curved) in flatten(path, t) {
             let bb = poly.iter().fold(Rect::new(f64::MAX, f64::MAX, f64::MIN, f64::MIN), |r, p| Rect::new(r.x0.min(p.x), r.y0.min(p.y), r.x1.max(p.x), r.y1.max(p.y)));
             match stroke {
+                Some(_) if curved => self.m.fills.push((bb, poly)),
                 Some(w) => {
                     for pair in poly.windows(2) {
                         self.m.segs.push(Seg { x0: pair[0].x, y0: pair[0].y, x1: pair[1].x, y1: pair[1].y, w: w.max(0.1) });
@@ -226,7 +267,9 @@ impl<'a> Device<'a> for Collector<'_> {
                 }
                 None => {
                     // thin filled rectangles are lines (staff lines, stems, barlines); others are beams etc.
-                    if bb.width() < 3.0 && bb.height() > 2.0 * bb.width() {
+                    if curved {
+                        self.m.fills.push((bb, poly));
+                    } else if bb.width() < 3.0 && bb.height() > 2.0 * bb.width() {
                         self.m.segs.push(Seg { x0: bb.center().x, y0: bb.y0, x1: bb.center().x, y1: bb.y1, w: bb.width() });
                     } else if bb.height() < 3.0 && bb.width() > 2.0 * bb.height() && poly.len() <= 6 && (poly[0].y - bb.center().y).abs() <= bb.height() {
                         // axis-aligned thin bar (a beam is slanted or thicker; keep both)
@@ -265,7 +308,9 @@ impl<'a> Device<'a> for Collector<'_> {
             self.m.glyphs.push(Glyph { sym, ch, x: origin.x, y: origin.y, size, smufl: sm });
         }
     }
-    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        self.m.images += 1;
+    }
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
 }
@@ -322,7 +367,7 @@ fn find_staves(m: &PageMarks) -> Vec<Staff> {
     let mut hs: Vec<(f64, f64, f64)> = m
         .segs
         .iter()
-        .filter(|s| (s.y0 - s.y1).abs() < 0.6 && (s.x1 - s.x0).abs() > m.width * 0.08)
+        .filter(|s| (s.y0 - s.y1).abs() < 0.6 && (s.x1 - s.x0).abs() > m.width * 0.08 && s.w < 1.6) // thick = a beam, not a staff line
         .map(|s| ((s.y0 + s.y1) / 2.0, s.x0.min(s.x1), s.x0.max(s.x1)))
         .collect();
     hs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -418,8 +463,18 @@ pub struct ReadReport {
     pub notes: usize,
 }
 
+/// Error from `read_pdf*` when the pages are pictures (a scanned book): needs optical recognition.
+pub const NOT_TYPESET_SCAN: &str = "This PDF is scanned pictures of pages, so the notes have to be recognised from the images (Audiveris).";
+/// Error from `read_pdf*` when there's no music at all (a letter, a receipt, a text-only book…).
+pub const NOT_MUSIC: &str = "No sheet music found in this PDF.";
+
 /// Read a typeset PDF into a Piece. Returns the piece and a quality report.
 pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), String> {
+    read_pdf_pages(bytes, title, None)
+}
+
+/// Like `read_pdf`, but only the given pages (1-based, inclusive).
+pub fn read_pdf_pages(bytes: Vec<u8>, title: &str, only: Option<(usize, usize)>) -> Result<(Piece, ReadReport), String> {
     let pages = extract(bytes)?;
     let mut notes: Vec<Note> = vec![];
     let mut t_global = 0.0f64;
@@ -433,9 +488,18 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
     let mut music_size_seen = 0.0f64;
     let mut guitar = false;
     let mut clefs_state: Vec<ClefKind> = vec![];
+    let mut first_key: Option<i32> = None;
+    let mut first_ts: Option<(u32, u32)> = None;
+    let mut key_changes: Vec<(f64, i32)> = vec![];
 
-    for m in &pages {
+    for (page_no, m) in pages.iter().enumerate() {
+        if only.is_some_and(|(a, b)| page_no + 1 < a || page_no + 1 > b) {
+            continue;
+        }
         let staves = find_staves(m);
+        if std::env::var("VS_DEBUG").is_ok() {
+            eprintln!("PAGE {} staves {} first measure {}", page_no + 1, staves.len(), report.measures + 1);
+        }
         if staves.is_empty() {
             continue;
         }
@@ -475,8 +539,29 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
         let is_music = |g: &Glyph| (g.size - music_size).abs() < music_size * 0.2 || (g.sym.is_some() && g.smufl && g.size > music_size * 0.55);
         for sys in &systems {
             report.systems += 1;
-            // use the bottom two staves for piano music (top ones may be a vocal line), else 1
-            let parts: Vec<usize> = if sys.len() >= 2 { sys[sys.len() - 2..].to_vec() } else { sys.clone() };
+            // Piano music is a treble staff over a bass staff. With more staves, take the lowest
+            // such pair (a vocal line sits on top) – unless the extra staves are below it
+            // (e.g. an alternative left hand), where the first pair is the one to play.
+            let clef_at = |i: usize| -> Option<ClefKind> {
+                let st = &staves[i];
+                m.glyphs
+                    .iter()
+                    .filter(|g| g.x < st.x0 + sp * 5.0 && g.y > st.top() - sp * 3.0 && g.y < st.bottom() + sp * 3.0 && g.size > music_size * 0.6)
+                    .find_map(|g| match g.sym {
+                        Some(Sym::ClefG) => Some(ClefKind::G),
+                        Some(Sym::ClefF) => Some(ClefKind::F),
+                        _ => None,
+                    })
+            };
+            let parts: Vec<usize> = if sys.len() > 2 {
+                let pairs: Vec<usize> = (0..sys.len() - 1).filter(|&k| clef_at(sys[k]) == Some(ClefKind::G) && clef_at(sys[k + 1]) == Some(ClefKind::F)).collect();
+                match pairs.last() {
+                    Some(&k) => vec![sys[k], sys[k + 1]],
+                    None => sys[sys.len() - 2..].to_vec(),
+                }
+            } else {
+                sys.clone()
+            };
             if parts.len() == 1 {
                 guitar = true;
             }
@@ -509,6 +594,19 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
             if parts.len() >= 2 {
                 let other = cand(&staves[parts[1]]);
                 bars.retain(|x| other.iter().any(|o| (o - x).abs() < sp * 0.6));
+                // Most programs draw a grand-staff barline as ONE line through both staves.
+                // When the system has those, trust only them (stems that happen to run from
+                // line to line in both hands would otherwise look like barlines).
+                let (t0, b1) = (staves[parts[0]].top(), staves[parts[parts.len() - 1]].bottom());
+                let through: Vec<f64> = m
+                    .segs
+                    .iter()
+                    .filter(|g| (g.x0 - g.x1).abs() < 0.8 && g.x0 > sys_x0 + sp * 0.5 && g.y0.min(g.y1) <= t0 + sp * 0.35 && g.y0.max(g.y1) >= b1 - sp * 0.35 && g.y0.min(g.y1) >= t0 - sp * 0.6 && g.y0.max(g.y1) <= b1 + sp * 0.6)
+                    .map(|g| g.x0)
+                    .collect();
+                if !through.is_empty() {
+                    bars = through;
+                }
             }
             bars.push(sys_x1);
             bars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -528,6 +626,31 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
             }
             for v in per_staff.iter_mut() {
                 v.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            // 8va / 8vb lines: from the "8va" sign along its dashed line to the end hook
+            let mut ottavas: Vec<Vec<(f64, f64, i32)>> = vec![vec![]; parts.len()];
+            for (pi, gl) in per_staff.iter().enumerate() {
+                for g in gl.iter() {
+                    let Some(Sym::Ottava(shift)) = g.sym else { continue };
+                    if !is_music(g) && g.size < music_size * 0.5 {
+                        continue;
+                    }
+                    let mut end = g.x + sp * 3.0;
+                    loop {
+                        let next = m
+                            .segs
+                            .iter()
+                            .filter(|d| (d.y0 - d.y1).abs() < 0.3 && (d.y0 - g.y).abs() < sp * 1.6 && d.x0.min(d.x1) > end - sp * 0.2 && d.x0.min(d.x1) < end + sp * 2.5 && (d.x1 - d.x0).abs() < sp * 4.0)
+                            .map(|d| d.x0.max(d.x1))
+                            .fold(f64::MIN, f64::max);
+                        if next > end + 0.1 && next < sys_x1 + sp {
+                            end = next;
+                        } else {
+                            break;
+                        }
+                    }
+                    ottavas[pi].push((g.x - sp * 0.6, end + sp * 0.6, shift as i32));
+                }
             }
             // first notehead/rest x in the system: everything before it is clef/key/time
             let first_event_x = per_staff
@@ -571,12 +694,10 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                 if m.glyphs.iter().any(|g| g.ch == '8' && g.x < first_event_x && g.y > st.bottom() && g.y < st.bottom() + sp * 3.0 && g.x < st.x0 + sp * 5.0) {
                     guitar = true;
                 }
-                if pi == 0 && (sharps > 0 || flats > 0 || !have_key) {
+                if pi == 0 {
                     let k = if sharps > 0 { sharps } else { -flats };
-                    if !have_key || k != 0 {
-                        key_fifths = k.clamp(-7, 7);
-                        have_key = true;
-                    }
+                    key_fifths = k.clamp(-7, 7);
+                    have_key = true;
                 }
                 if !digits.is_empty() {
                     let top: Vec<u8> = digits.iter().filter(|d| d.1 < st.mid()).map(|d| d.2).collect();
@@ -590,8 +711,14 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                 }
             }
             let _ = have_ts;
-            let bar_len = ts.0 as f64 * 4.0 / ts.1 as f64;
-            let alters = key_alters(key_fifths);
+            let mut bar_len = ts.0 as f64 * 4.0 / ts.1 as f64;
+            let mut alters = key_alters(key_fifths);
+            if first_key.is_none() {
+                first_key = Some(key_fifths);
+                first_ts = Some(ts);
+            } else if key_changes.last().map(|k| k.1) != Some(key_fifths) {
+                key_changes.push((t_global, key_fifths));
+            }
 
             // per measure
             for mi in 0..bars.len() {
@@ -599,6 +726,44 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                 let mx1 = bars[mi];
                 if mx1 - mx0 < sp * 1.5 || mx1 < first_event_x {
                     continue;
+                }
+                // a key or time signature change at the start of a bar inside the system
+                if mi > 0 {
+                    let gl = &per_staff[0];
+                    let st = &staves[parts[0]];
+                    let first_x = per_staff
+                        .iter()
+                        .flat_map(|v| v.iter())
+                        .filter(|g| g.x >= mx0 && g.x < mx1 && matches!(g.sym, Some(Sym::HeadBlack | Sym::HeadHalf | Sym::HeadWhole | Sym::RestWhole | Sym::RestHalf | Sym::RestQuarter | Sym::Rest8 | Sym::Rest16)) && is_music(g))
+                        .map(|g| g.x)
+                        .fold(f64::MAX, f64::min);
+                    let pre: Vec<&&Glyph> = gl.iter().filter(|g| g.x > mx0 && g.x < first_x - sp * 1.3 && is_music(g) && g.y > st.top() - sp * 2.0 && g.y < st.bottom() + sp * 2.0).collect();
+                    let sh = pre.iter().filter(|g| g.sym == Some(Sym::Sharp)).count() as i32;
+                    let fl = pre.iter().filter(|g| g.sym == Some(Sym::Flat)).count() as i32;
+                    let na = pre.iter().filter(|g| g.sym == Some(Sym::Natural)).count();
+                    let newkey = if sh > 0 && fl == 0 { Some(sh) } else if fl > 0 && sh == 0 { Some(-fl) } else if na > 0 && sh == 0 && fl == 0 { Some(0) } else { None };
+                    if let Some(k) = newkey {
+                        if k.clamp(-7, 7) != key_fifths {
+                            key_fifths = k.clamp(-7, 7);
+                            alters = key_alters(key_fifths);
+                            key_changes.push((t_global, key_fifths));
+                        }
+                    }
+                    let mut top: Vec<(f64, u8)> = vec![];
+                    let mut bot: Vec<(f64, u8)> = vec![];
+                    for g in &pre {
+                        if let Some(Sym::TimeDigit(d)) = g.sym {
+                            if g.y < st.mid() { top.push((g.x, d)) } else { bot.push((g.x, d)) }
+                        }
+                    }
+                    top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    bot.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let num = top.iter().fold(0u32, |a, d| a * 10 + d.1 as u32);
+                    let den = bot.iter().fold(0u32, |a, d| a * 10 + d.1 as u32);
+                    if num > 0 && [1, 2, 4, 8, 16].contains(&den) {
+                        ts = (num, den);
+                        bar_len = ts.0 as f64 * 4.0 / ts.1 as f64;
+                    }
                 }
                 let mut events: Vec<Event> = vec![];
                 for (pi, gl) in per_staff.iter().enumerate() {
@@ -652,8 +817,10 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                         let ys: Vec<f64> = chord.iter().map(|&c| heads[c].y).collect();
                         let (ymin, ymax) = (ys.iter().cloned().fold(f64::MAX, f64::min), ys.iter().cloned().fold(f64::MIN, f64::max));
                         // stem: vertical segment starting at a head edge
-                        let mut stem: Option<(f64, f64, bool)> = None; // x, far y, down
-                        let mut best_d: Option<f64> = None;
+                        // A head can carry two stems: one up, one down (two voices sharing a note, as in
+                        // classical guitar music where the tune's note also starts the accompaniment).
+                        let mut best_up: Option<((f64, f64, bool), f64)> = None; // (x, far y, down), edge distance
+                        let mut best_down: Option<((f64, f64, bool), f64)> = None;
                         if base < 4.0 {
                             for g in &m.segs {
                                 if (g.x0 - g.x1).abs() > 0.8 || g.w > sp * 0.4 {
@@ -684,27 +851,58 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                                     None
                                 };
                                 if let Some(c) = cand {
-                                    if best_d.is_none_or(|d| edge_d < d) {
-                                        best_d = Some(edge_d);
-                                        stem = Some(c);
+                                    let slot = if c.2 { &mut best_down } else { &mut best_up };
+                                    if slot.is_none_or(|(_, d)| edge_d < d) {
+                                        *slot = Some((c, edge_d));
                                     }
                                 }
                             }
                         }
+                        // an up stem sits on the right edge, a down stem on the left; both only count
+                        // when each is on its proper side
+                        let stems: Vec<Option<(f64, f64, bool)>> = match (best_up, best_down) {
+                            (Some((u, _)), Some((d, _))) if u.0 > d.0 + head_w * 0.5 => vec![Some(u), Some(d)],
+                            (Some((u, du)), Some((d, dd))) => vec![Some(if du <= dd { u } else { d })],
+                            (Some((u, _)), None) => vec![Some(u)],
+                            (None, Some((d, _))) => vec![Some(d)],
+                            (None, None) => vec![None],
+                        };
+                        for stem in stems {
                         let mut dur = base;
                         if let Some((sx, sy, down)) = stem {
                             if base == 1.0 {
                                 // beams crossing the stem near its far end
-                                let mut beams = 0;
-                                for (bb, _) in &m.fills {
-                                    if bb.x0 - 0.5 <= sx && bb.x1 + 0.5 >= sx && bb.width() > sp * 0.8 && bb.height() < sp * 4.0 {
-                                        let reach = if down { sy - bb.y0 } else { bb.y1 - sy };
-                                        if reach > -sp * 0.3 && reach < sp * 2.6 {
-                                            // count distinct beam bands
-                                            beams += 1;
+                                // beams are often drawn in pieces (one per stem gap), so count distinct
+                                // bands by where they cross the stem, not the number of shapes
+                                let mut bands: Vec<f64> = vec![];
+                                for (bb, poly) in &m.fills {
+                                    // (slanted beams can have a tall bounding box, so judge by the crossing point)
+                                    if bb.x0 - 0.5 <= sx && bb.x1 + 0.5 >= sx && bb.width() > sp * 0.8 && bb.height() < sp * 12.0 {
+                                        let near_tip = if down { sy - bb.y0 > -sp * 0.6 && bb.y1 - sy < sp * 12.0 } else { bb.y1 - sy > -sp * 0.6 && sy - bb.y0 < sp * 12.0 };
+                                        if near_tip {
+                                            let xq = sx.clamp(bb.x0 + 0.01, bb.x1 - 0.01);
+                                            let ys: Vec<f64> = poly
+                                                .windows(2)
+                                                .filter(|w| (w[0].x - xq) * (w[1].x - xq) <= 0.0 && (w[0].x - w[1].x).abs() > 1e-6)
+                                                .map(|w| w[0].y + (w[1].y - w[0].y) * (xq - w[0].x) / (w[1].x - w[0].x))
+                                                .collect();
+                                            let (lo, hi) = ys.iter().fold((f64::MAX, f64::MIN), |a, y| (a.0.min(*y), a.1.max(*y)));
+                                            // a beam is a thick band (~half a space); slurs and ties are thin curves
+                                            if ys.len() < 2 || hi - lo < sp * 0.28 || hi - lo > sp * 0.9 {
+                                                continue;
+                                            }
+                                            let c = (lo + hi) / 2.0;
+                                            let reach = if down { sy - c } else { c - sy };
+                                            if reach < -sp * 0.6 || reach > sp * 2.6 {
+                                                continue;
+                                            }
+                                            if !bands.iter().any(|b| (b - c).abs() < sp * 0.35) {
+                                                bands.push(c);
+                                            }
                                         }
                                     }
                                 }
+                                let beams = bands.len();
                                 // flags
                                 let flags = m
                                     .glyphs
@@ -740,6 +938,7 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                             })
                             .collect();
                         events.push(Event { x: cx_left, dur, pitches, rest: false, stem_down: stem.map(|s| s.2), staff: pi, rest_y: None });
+                        }
                     }
                     // rests
                     for g in &in_measure {
@@ -761,7 +960,9 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                     // apply accidentals "for the rest of the measure"
                     let _ = &accs;
                 }
-                // triplets: tuplet digits near events
+                // triplets: tuplet digits near events (a fingering "3" looks the same, so a triplet
+                // reading is only used when the bar doesn't add up without it)
+                let plain = events.clone();
                 for g in m.glyphs.iter().filter(|g| matches!(g.sym, Some(Sym::TupletDigit(3))) || (g.ch == '3' && g.size < music_size * 0.7 && g.size > music_size * 0.2)) {
                     if g.x < mx0 || g.x > mx1 {
                         continue;
@@ -780,65 +981,36 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                     continue;
                 }
                 report.measures += 1;
-                // Timing: every staff (and every voice in it) fills the bar by itself.
-                let mut onset = vec![0.0f64; events.len()];
-                let mut totals: Vec<f64> = vec![];
-                let mut staff_clean = true;
-                for pi in 0..parts.len() {
-                    let mine: Vec<usize> = {
-                        let mut v: Vec<usize> = (0..events.len()).filter(|&i| events[i].staff == pi).collect();
-                        v.sort_by(|a, b| events[*a].x.partial_cmp(&events[*b].x).unwrap_or(std::cmp::Ordering::Equal));
-                        v
-                    };
-                    if mine.is_empty() {
-                        continue;
-                    }
-                    // lay out a list of events as one voice: columns by x, step = shortest event in the column
-                    let lay = |ids: &[usize], onset: &mut Vec<f64>| -> f64 {
-                        let mut cols: Vec<(f64, Vec<usize>)> = vec![];
-                        for &i in ids {
-                            match cols.last_mut() {
-                                Some(c) if (events[i].x - c.0).abs() < sp * 0.9 => c.1.push(i),
-                                _ => cols.push((events[i].x, vec![i])),
+                let mids: Vec<f64> = parts.iter().map(|&i| staves[i].mid()).collect();
+                let (mut onset, mut totals, mut staff_clean) = time_measure(&plain, &mids, sp, bar_len, mx1);
+                if !staff_clean {
+                    let (o2, t2, c2) = time_measure(&events, &mids, sp, bar_len, mx1);
+                    if c2 {
+                        (onset, totals, staff_clean) = (o2, t2, c2);
+                    } else {
+                        // triplets whose "3" is only printed in the first bars: quavers that make a
+                        // voice exactly half as long again as the bar
+                        let mut trip = plain.clone();
+                        for e in trip.iter_mut() {
+                            if e.dur <= 0.5 + 1e-9 {
+                                e.dur *= 2.0 / 3.0;
                             }
                         }
-                        let mut t = 0.0;
-                        let mut end: f64 = 0.0;
-                        for c in &cols {
-                            for &i in &c.1 {
-                                onset[i] = t;
-                                end = end.max(t + events[i].dur);
-                            }
-                            let step = c.1.iter().map(|&i| events[i].dur).fold(f64::MAX, f64::min);
-                            t += step;
+                        let (o3, t3, c3) = time_measure(&trip, &mids, sp, bar_len, mx1);
+                        if c3 {
+                            (onset, totals, staff_clean) = (o3, t3, c3);
+                            events = trip;
+                        } else {
+                            events = plain;
                         }
-                        t.max(end.min(t + 1e-9)).max(if (end - bar_len).abs() < 1e-3 { bar_len } else { t })
-                    };
-                    let total_a = lay(&mine, &mut onset);
-                    if (total_a - bar_len).abs() < 1e-3 {
-                        totals.push(total_a);
-                        continue;
                     }
-                    // two voices: stems up / stems down (rests by height)
-                    let mid = staves[parts[pi]].mid();
-                    let (up, down): (Vec<usize>, Vec<usize>) = mine.iter().partition(|&&i| match events[i].stem_down {
-                        Some(d) => !d,
-                        None => events[i].rest_y.map(|y| y < mid).unwrap_or(true),
-                    });
-                    let mut on_b = onset.clone();
-                    let tu = if up.is_empty() { bar_len } else { lay(&up, &mut on_b) };
-                    let td = if down.is_empty() { bar_len } else { lay(&down, &mut on_b) };
-                    if (tu - bar_len).abs() < 1e-3 && (td - bar_len).abs() < 1e-3 {
-                        onset = on_b;
-                        totals.push(bar_len);
-                        continue;
-                    }
-                    staff_clean = false;
-                    totals.push(total_a);
+                } else {
+                    events = plain;
                 }
+                let _ = &mut onset;
                 let total = totals.iter().cloned().fold(0.0, f64::max);
                 let clean = staff_clean;
-                if std::env::var("VS_DEBUG").is_ok() && !clean && report.measures <= 40 {
+                if std::env::var("VS_DEBUG").is_ok() && !clean && report.measures <= std::env::var("VS_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(40) {
                     eprintln!("measure {} ts {:?} totals {:?} bar {:.2}", report.measures, ts, totals, bar_len);
                     for (i, e) in events.iter().enumerate() {
                         eprintln!("   x{:.0} s{} t{:.3} {}{:.3} {:?} down={:?}", e.x, e.staff, onset[i], if e.rest { "R" } else { "" }, e.dur, e.pitches.iter().map(|p| p.0).collect::<Vec<_>>(), e.stem_down);
@@ -874,6 +1046,9 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
                         if guitar {
                             pitch -= 12;
                         }
+                        if let Some(o) = ottavas[e.staff].iter().find(|o| e.x >= o.0 && e.x <= o.1) {
+                            pitch += o.2;
+                        }
                         let hand = if parts.len() >= 2 {
                             if e.staff == 0 { Hand::Right } else { Hand::Left }
                         } else {
@@ -893,7 +1068,10 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
     }
     let _ = music_size_seen;
     if notes.is_empty() {
-        return Err("No typeset music found. This looks like a scanned (picture) PDF – use 'Make playable' (Audiveris) for scans.".into());
+        // tell a scanned book (pictures of pages) from a document that just isn't music
+        let considered: Vec<&PageMarks> = pages.iter().enumerate().filter(|(i, _)| only.is_none_or(|(a, b)| i + 1 >= a && i + 1 <= b)).map(|(_, m)| m).collect();
+        let scans = considered.iter().filter(|m| m.images > 0 && m.glyphs.len() < 400).count();
+        return Err(if scans * 2 >= considered.len().max(1) { NOT_TYPESET_SCAN.into() } else { NOT_MUSIC.into() });
     }
     // a single guitar line with no stems pointing down: split by pitch instead
     if guitar && !notes.iter().any(|n| n.hand == Hand::Left) {
@@ -903,6 +1081,23 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
             }
         }
     }
+    // the same note read in two voices: keep one, the longer
+    notes.sort_by(|a, b| a.pitch.cmp(&b.pitch).then(a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal)));
+    let mut merged: Vec<Note> = Vec::with_capacity(notes.len());
+    for n in notes {
+        match merged.last_mut() {
+            Some(l) if l.pitch == n.pitch && (l.start - n.start).abs() < 1e-6 => {
+                if n.dur > l.dur {
+                    l.dur = n.dur;
+                    if n.hand == Hand::Left {
+                        l.hand = Hand::Left;
+                    }
+                }
+            }
+            _ => merged.push(n),
+        }
+    }
+    let notes = merged;
     let mut p = Piece {
         id: String::new(),
         title: title.to_string(),
@@ -910,21 +1105,134 @@ pub fn read_pdf(bytes: Vec<u8>, title: &str) -> Result<(Piece, ReadReport), Stri
         notes_text: if guitar {
             "Read from a guitar score: bass notes (stems down) go to the left hand; played an octave lower, as a guitar sounds.".into()
         } else {
-            "Read directly from the typeset PDF. Check tricky bars against the page.".into()
+            "Read directly from your PDF.".into()
         },
         bpm: 90.0,
-        ts_num: ts.0,
-        ts_den: ts.1,
-        key_fifths,
+        ts_num: first_ts.unwrap_or(ts).0,
+        ts_den: first_ts.unwrap_or(ts).1,
+        key_fifths: first_key.unwrap_or(key_fifths),
         minor: false,
         pickup: if pickup > 0.0 { pickup } else { 0.0 },
         notes,
         origin: Origin::BuiltIn,
-        key_changes: vec![],
+        key_changes: {
+            // keep real changes only (drop repeats and a "change" to the key already in force)
+            let mut v: Vec<(f64, i32)> = vec![];
+            let mut cur = first_key.unwrap_or(key_fifths);
+            for (t, k) in key_changes {
+                if k != cur {
+                    v.retain(|x| (x.0 - t).abs() > 1e-6);
+                    v.push((t, k));
+                    cur = k;
+                }
+            }
+            v
+        },
     };
-    p.minor = crate::import::guess_minor(&p.notes, key_fifths);
+    p.minor = crate::import::guess_minor(&p.notes, p.key_fifths);
     p.sort_notes();
     Ok((p, report))
+}
+
+/// Lay out a list of events as one voice: columns by x, each column lasts as long as its
+/// shortest event. Returns the voice's length in beats.
+fn lay(events: &[Event], ids: &[usize], onset: &mut [f64], sp: f64, bar_len: f64) -> f64 {
+    let mut cols: Vec<(f64, Vec<usize>)> = vec![];
+    for &i in ids {
+        match cols.last_mut() {
+            Some(c) if (events[i].x - c.0).abs() < sp * 0.9 => c.1.push(i),
+            _ => cols.push((events[i].x, vec![i])),
+        }
+    }
+    let mut t = 0.0;
+    let mut end: f64 = 0.0;
+    for c in &cols {
+        for &i in &c.1 {
+            onset[i] = t;
+            end = end.max(t + events[i].dur);
+        }
+        let step = c.1.iter().map(|&i| events[i].dur).fold(f64::MAX, f64::min);
+        t += step;
+    }
+    t.max(end.min(t + 1e-9)).max(if (end - bar_len).abs() < 1e-3 { bar_len } else { t })
+}
+
+fn by_x(events: &[Event], mut v: Vec<usize>) -> Vec<usize> {
+    v.sort_by(|a, b| events[*a].x.partial_cmp(&events[*b].x).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
+/// Timing: every staff (and every voice in it) fills the bar by itself.
+/// Returns onsets, per-staff totals and whether the bar adds up.
+fn time_measure(events: &[Event], mids: &[f64], sp: f64, bar_len: f64, bar_x1: f64) -> (Vec<f64>, Vec<f64>, bool) {
+    let mut onset = vec![0.0f64; events.len()];
+    let mut totals: Vec<f64> = vec![];
+    let mut staff_ok = vec![true; mids.len()];
+    for pi in 0..mids.len() {
+        let mine = by_x(events, (0..events.len()).filter(|&i| events[i].staff == pi).collect());
+        if mine.is_empty() {
+            continue;
+        }
+        let total_a = lay(events, &mine, &mut onset, sp, bar_len);
+        if (total_a - bar_len).abs() < 1e-3 {
+            totals.push(total_a);
+            continue;
+        }
+        // two voices: stems up / stems down (rests by height)
+        let mid = mids[pi];
+        let (up, down): (Vec<usize>, Vec<usize>) = mine.iter().partition(|&&i| match events[i].stem_down {
+            Some(d) => !d,
+            None => events[i].rest_y.map(|y| y < mid).unwrap_or(true),
+        });
+        let mut on_b = onset.clone();
+        let tu = if up.is_empty() { bar_len } else { lay(events, &up, &mut on_b, sp, bar_len) };
+        let td = if down.is_empty() { bar_len } else { lay(events, &down, &mut on_b, sp, bar_len) };
+        if (tu - bar_len).abs() < 1e-3 && (td - bar_len).abs() < 1e-3 {
+            onset = on_b;
+            totals.push(bar_len);
+            continue;
+        }
+        staff_ok[pi] = false;
+        totals.push(total_a);
+    }
+    if staff_ok.iter().all(|&c| c) {
+        return (onset, totals, true);
+    }
+    // One line shared between the hands (LH starts a run, RH finishes it; the idle staff's
+    // rests are often hidden): read both staves as a single voice.
+    if mids.len() >= 2 {
+        let all = by_x(events, (0..events.len()).collect());
+        let mut on_c = vec![0.0; events.len()];
+        let t = lay(events, &all, &mut on_c, sp, bar_len);
+        if (t - bar_len).abs() < 1e-3 {
+            return (on_c, vec![bar_len], true);
+        }
+    }
+    // A staff that doesn't add up by itself (hidden rests, cross-staff notes): place its
+    // notes by lining them up with the staves that do.
+    let mut anchors: Vec<(f64, f64)> = (0..events.len()).filter(|&i| staff_ok[events[i].staff]).map(|i| (events[i].x, onset[i])).collect();
+    if anchors.is_empty() {
+        return (onset, totals, false);
+    }
+    anchors.push((bar_x1, bar_len));
+    anchors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut all_matched = true;
+    for i in 0..events.len() {
+        if staff_ok[events[i].staff] {
+            continue;
+        }
+        let x = events[i].x;
+        if let Some(a) = anchors.iter().filter(|a| (a.0 - x).abs() < sp * 0.9).min_by(|a, b| (a.0 - x).abs().partial_cmp(&(b.0 - x).abs()).unwrap_or(std::cmp::Ordering::Equal)) {
+            onset[i] = a.1;
+        } else {
+            all_matched = false;
+            let k = anchors.iter().position(|a| a.0 > x).unwrap_or(anchors.len() - 1).max(1);
+            let (l, r) = (anchors[k - 1], anchors[k]);
+            let f = if r.0 > l.0 { ((x - l.0) / (r.0 - l.0)).clamp(0.0, 1.0) } else { 0.0 };
+            onset[i] = l.1 + f * (r.1 - l.1);
+        }
+    }
+    (onset, vec![bar_len], all_matched)
 }
 
 /// Quick check: does this PDF contain typeset music (vector music-font glyphs)?
@@ -969,5 +1277,25 @@ pub fn debug_bars(bytes: Vec<u8>) {
         }
         let fills: Vec<_> = m.fills.iter().filter(|(bb, _)| bb.width() < 3.0 && bb.y0 < b && bb.y1 > t).take(10).collect();
         for (bb, _) in fills { eprintln!("fill {:?}", bb); }
+    }
+}
+
+#[allow(dead_code)]
+pub fn debug_page_glyphs(bytes: Vec<u8>, page: usize) {
+    if let Ok(pages) = extract(bytes) {
+        let m = &pages[page];
+        for g in &m.glyphs {
+            if g.sym.is_none() || matches!(g.sym, Some(Sym::TimeDigit(_))) {
+                eprintln!("{:?} U+{:04X} x{:.1} y{:.1} size {:.1}", g.ch, g.ch as u32, g.x, g.y, g.size);
+            }
+        }
+        let st = find_staves(m);
+        for s in &st { eprintln!("staff {:?}", s.lines.map(|v| v.round())); }
+        for s in m.segs.iter().filter(|s| (s.y0 - s.y1).abs() < 0.6 && (s.x1 - s.x0).abs() > m.width * 0.08 && s.y0 > 200.0 && s.y0 < 320.0) {
+            eprintln!("hrow y{:.2} x{:.1}-{:.1} w{:.2}", s.y0, s.x0, s.x1, s.w);
+        }
+        for g in m.segs.iter().filter(|g| (g.y0 - g.y1).abs() < 0.3 && (g.x1 - g.x0).abs() < 6.0 && (g.x1 - g.x0).abs() > 0.5).take(30) {
+            eprintln!("hseg x{:.1}-{:.1} y{:.1} w{:.2}", g.x0, g.x1, g.y0, g.w);
+        }
     }
 }

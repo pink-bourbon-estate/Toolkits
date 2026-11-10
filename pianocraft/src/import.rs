@@ -205,7 +205,7 @@ fn unzip_mxl(bytes: &[u8]) -> Result<String, String> {
     if let Ok(mut c) = z.by_name("META-INF/container.xml") {
         let mut s = String::new();
         c.read_to_string(&mut s).ok();
-        if let Ok(doc) = roxmltree::Document::parse(&s) {
+        if let Ok(doc) = parse_xml(&s) {
             root = doc.descendants().find(|n| n.has_tag_name("rootfile")).and_then(|n| n.attribute("full-path")).map(String::from);
         }
     }
@@ -226,8 +226,14 @@ fn child_text<'a>(n: roxmltree::Node<'a, 'a>, tag: &str) -> Option<&'a str> {
     n.children().find(|c| c.has_tag_name(tag)).and_then(|c| c.text())
 }
 
+/// Parse XML, allowing the <!DOCTYPE …> line that MusicXML files (Audiveris, MuseScore,
+/// Sibelius, Finale…) always start with. The parser refuses it by default.
+fn parse_xml(xml: &str) -> Result<roxmltree::Document<'_>, roxmltree::Error> {
+    roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() })
+}
+
 pub fn import_musicxml(xml: &str, fallback_title: &str) -> Result<Piece, String> {
-    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("Not valid MusicXML: {e}"))?;
+    let doc = parse_xml(xml).map_err(|e| format!("Not valid MusicXML: {e}"))?;
     let root = doc.root_element();
     if root.has_tag_name("score-timewise") {
         return Err("Timewise MusicXML isn't supported; re-export as standard (partwise) MusicXML.".into());

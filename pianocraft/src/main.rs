@@ -42,6 +42,7 @@ fn main() -> eframe::Result<()> {
     match args.get(1).map(|s| s.as_str()) {
         Some("--readpdf") if args.len() >= 3 => {
             let bytes = std::fs::read(&args[2]).unwrap_or_default();
+            if let Some(pg) = std::env::var("VS_PAGE").ok().and_then(|v| v.parse().ok()) { vecscore::debug_page_glyphs(bytes.clone(), pg); return Ok(()); }
             if args.iter().any(|a| a == "--bars") { vecscore::debug_bars(bytes.clone()); return Ok(()); }
             if args.iter().any(|a| a == "--dump") {
                 vecscore::debug_dump(bytes.clone());
@@ -57,6 +58,31 @@ fn main() -> eframe::Result<()> {
                     }
                 }
                 Err(e) => println!("ERROR: {e}"),
+            }
+            return Ok(());
+        }
+        Some("--convert") if args.len() >= 3 => {
+            // headless version of Library → "Make all PDFs playable" (prints what it would add)
+            let mut jobs = vec![];
+            for a in &args[2..] {
+                let p = std::path::PathBuf::from(a);
+                if p.is_dir() {
+                    let mut v: Vec<_> = std::fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()).filter(|q| q.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))).collect();
+                    v.sort();
+                    jobs.extend(v.into_iter().map(|pdf| ui::convert::Job { pdf, pages: None }));
+                } else {
+                    jobs.push(ui::convert::Job { pdf: p, pages: None });
+                }
+            }
+            let progress = curriculum::Progress::load();
+            let c = ui::convert::start(jobs, ui::pdfview::find_audiveris(&progress.audiveris));
+            while let Ok(m) = c.rx.recv() {
+                match m {
+                    ui::convert::ConvMsg::Working { index, what } => println!("[{}/{}] {what}", index + 1, c.total),
+                    ui::convert::ConvMsg::Piece(p) => println!("   + {} ({} bars, {} notes) – {}", p.title, p.bar_count(), p.notes.len(), p.notes_text),
+                    ui::convert::ConvMsg::Skipped { pdf, why } => println!("   - skipped {}: {why}", pdf.display()),
+                    ui::convert::ConvMsg::Finished => break,
+                }
             }
             return Ok(());
         }

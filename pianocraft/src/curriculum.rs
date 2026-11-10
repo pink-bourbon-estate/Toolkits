@@ -107,7 +107,12 @@ pub struct Progress {
     pub pieces: HashMap<String, PieceProgress>,
     pub log: Vec<LogEntry>,
     pub minutes_by_day: HashMap<String, f32>,
+    /// Imported and converted music. Kept in its own file (library.json) because converted
+    /// books can be large; read from progress.json too for older versions.
+    #[serde(default, skip_serializing)]
     pub library: Vec<Piece>,
+    #[serde(skip)]
+    pub library_dirty: std::cell::Cell<bool>,
     #[serde(default)]
     pub scan_folder: String,
     #[serde(default)]
@@ -154,9 +159,30 @@ pub fn data_dir() -> PathBuf {
 impl Progress {
     pub fn load() -> Progress {
         let p = data_dir().join("progress.json");
-        std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        let mut pr: Progress = std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let lib = data_dir().join("library.json");
+        match std::fs::read_to_string(&lib).ok().and_then(|s| serde_json::from_str::<Vec<Piece>>(&s).ok()) {
+            Some(l) => pr.library = l,
+            // first run of this version: move the library out of progress.json
+            None if !pr.library.is_empty() => pr.library_dirty.set(true),
+            None => {}
+        }
+        pr
+    }
+    /// Call after changing `library`; it's written on the next save.
+    pub fn library_changed(&self) {
+        self.library_dirty.set(true);
     }
     pub fn save(&self) {
+        if self.library_dirty.replace(false) {
+            let p = data_dir().join("library.json");
+            if let Ok(s) = serde_json::to_string(&self.library) {
+                let tmp = p.with_extension("json.tmp");
+                if std::fs::write(&tmp, s).is_ok() {
+                    let _ = std::fs::rename(tmp, p);
+                }
+            }
+        }
         let p = data_dir().join("progress.json");
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let tmp = p.with_extension("json.tmp");
