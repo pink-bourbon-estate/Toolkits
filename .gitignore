@@ -26,3 +26,7 @@ id_rsa*
 # Python bytecode caches
 __pycache__/
 *.pyc
+
+# BakeCraft app data
+current_plan.json
+settings.json
