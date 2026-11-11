@@ -22,3 +22,7 @@ id_rsa*
 
 # …except the built-in, freely licensed repertoire
 !pianocraft/repertoire/*.mid
+
+# Python bytecode caches
+__pycache__/
+*.pyc
