@@ -8,6 +8,8 @@ Small desktop tools, mostly built in Rust with egui. Each tool lives in its own 
 | [ChessCraft](chesscraft/) | Chess opening trainer for the Modern Defence (Black) and the London System (White): a full Stockfish-generated and move-checked line tree, Explore/Learn/Drill modes, and honest spaced repetition | [Releases](https://github.com/pink-bourbon-estate/toolkits/releases) (`chesscraft-v0.1.N`) |
 | [YouTube Transcripts](youtube-transcripts/) | Python script: download the captions of a channel, playlist or video as Obsidian-style notes and combine them into master files for analysis | [`get_transcripts.py`](youtube-transcripts/get_transcripts.py) |
 | [YouTube Frames](youtube-frames/) | Python script: capture a frame from a YouTube video every mm:ss and save them as compressed 960x540 JPEGs | [`youtube_frames.py`](youtube-frames/youtube_frames.py) |
+| [PlanetEbook Downloader](planetebook-downloader/) | Python script: download a fixed list of 82 classic books from planetebook.com as EPUB files, skipping any you already have | [`planetebook_download.py`](planetebook-downloader/planetebook_download.py) |
+| [Artvee Offline Downloader](artvee-downloader/) | Python script: download public-domain artwork from Artvee for personal offline study, resized, organised by category and artist, and resumable | [`artvee_offline_downloader.py`](artvee-downloader/artvee_offline_downloader.py) |
 
 ## Privacy and security
 - No accounts, telemetry or tracking. The only network use is the optional update check (anonymous download from github.com), plus links you click yourself.
