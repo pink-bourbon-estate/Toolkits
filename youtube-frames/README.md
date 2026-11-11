@@ -22,3 +22,11 @@ At the top of the script: `WIDTH`, `HEIGHT`, `JPEG_QUALITY`, and `CROP_TO_FILL` 
 - Only the video stream is read (no audio) and nothing is kept except the JPEGs.
 - It reads through the whole video, so long videos take a while.
 - Respect YouTube's terms and creators' rights; use frames for personal study.
+
+## Version
+Current version: **1.1** (shown when the script starts).
+
+| Version | Changes |
+| --- | --- |
+| 1.1 | Added beginner-friendly comments throughout the script and a "how it works" guide at the top. The version number now appears in the start-up banner. No change to behaviour. |
+| 1.0 | First release: capture a frame at a fixed interval and save compressed JPEGs. |

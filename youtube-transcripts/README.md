@@ -24,3 +24,11 @@ Options: `--pdf` (also write PDFs), `--words N` (max words per master file, defa
 - Videos without captions are listed in `_no_captions.txt`.
 - Private playlists need a sign-in: make the playlist Unlisted, or let the script borrow a browser's YouTube sign-in when it asks (or set `COOKIES_FROM_BROWSER` at the top of the script).
 - Respect YouTube's terms and creators' rights; use transcripts for personal study.
+
+## Version
+Current version: **1.1** (`py get_transcripts.py --version`).
+
+| Version | Changes |
+| --- | --- |
+| 1.1 | Added beginner-friendly comments throughout the script, a "how it is organised" guide at the top, and a `--version` option. No change to behaviour. |
+| 1.0 | First release: channel, playlist and single-video download, Obsidian-style notes, combined master files, optional PDF. |
