@@ -1,7 +1,7 @@
 //! Lay the pieces out on one big sheet (inches), draw them, and cut the sheet into printable pages.
 use crate::geom::*;
 use crate::params::Params;
-use crate::tee::{fmt, Draft, Mark, Piece};
+use crate::tee::{Draft, Mark, Piece};
 
 fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
 fn f(v: f64) -> String { format!("{:.3}", v) }
@@ -98,7 +98,7 @@ fn draw_piece(pc: &Piece, p: &Params) -> (String, (P, P)) {
             if !cm || k % 2 == 0 { s += &text(rx + 0.18, y + 0.04, 0.12, "#555", &format!("{}", k), ""); }
             k += 1;
         }
-        s += &text(lo.0, by + 0.5, 0.13, "#555", if cm { "ruler: cm from the construction origin (point 0 / fold)" } else { "ruler: inches from the construction origin (point 0 / fold)" }, "");
+        s += &text(lo.0, by + 0.5, 0.13, "#555", if cm { "ruler: cm from the construction origin (the 0 mark)" } else { "ruler: inches from the construction origin (the 0 mark)" }, "");
         s += "</g>\n";
     }
     let mut all = pc.outline.clone();
@@ -122,12 +122,9 @@ pub fn sheet(d: &Draft, p: &Params) -> Sheet {
         cx += w + 0.3; row_h = row_h.max(h); width = width.max(cx);
     }
     let h = cy + row_h + 0.5;
-    let cm = p.units == "cm";
     let mut head = String::new();
-    head += &text(0.5, 0.7, 0.45, "#111", &format!("{} t-shirt, {} sleeve", p.fit, p.sleeve), "font-weight=\"bold\"");
-    head += &text(0.5, 1.05, 0.18, "#333", &format!("chest {}  neck {}  shoulder {}  bicep {}", fmt(p.chest, cm), fmt(p.neck, cm), fmt(p.shoulder, cm), fmt(p.bicep, cm)), "");
-    head += &text(0.5, 1.3, 0.18, "#333", &format!("wrist {}  CB neck to waist {}", fmt(p.wrist, cm), fmt(p.cb_to_waist, cm)), "");
-    head += &text(0.5, 1.55, 0.18, "#333", "Print at 100%. Seam allowance 1/2 in included.", "");
+    head += &text(0.5, 0.7, 0.45, "#111", &d.title, "font-weight=\"bold\"");
+    for (i, l) in d.info.iter().take(3).enumerate() { head += &text(0.5, 1.05 + 0.25 * i as f64, 0.18, "#333", l, ""); }
     head += &poly(&[(0.5, 1.8), (1.5, 1.8), (1.5, 2.8), (0.5, 2.8)], "#111", 0.02, "", "none");
     head += &text(1.65, 2.35, 0.2, "#111", "<- this square must measure 1 in (2.54 cm)", "");
     Sheet { w: width.max(max_w * 0.0 + 8.0) + 0.5, h, inner: format!("{}{}", head, body) }

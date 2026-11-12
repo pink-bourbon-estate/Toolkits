@@ -43,16 +43,22 @@
 <main>
 <aside>
   <fieldset><legend>1 · Garment and fit</legend>
-    <label>Garment <select id="garment"><option value="tshirt">T-shirt</option><option disabled>Shirt (soon)</option><option disabled>Trousers (soon)</option><option disabled>Joggers (soon)</option><option disabled>Hoodie (soon)</option></select></label>
+    <label>Garment <select id="garment"><option value="tshirt">T-shirt</option><option value="shirt">Shirt (collar, button front)</option><option value="hoodie">Hoodie</option><option value="trousers">Trousers</option><option value="knit">Knitted pullover (basic)</option></select></label>
     <label>Fit <select id="fit"><option value="fitted">Fitted (tailored block)</option><option value="regular">Regular</option><option value="baggy" selected>Baggy</option></select></label>
-    <label>Sleeve <select id="sleeve"><option value="short">Short</option><option value="long">Long</option></select></label>
-    <label>Length <select id="length"><option value="standard">Standard</option><option value="long" selected>Long line (+4 in)</option></select></label>
+    <label id="row-sleeve">Sleeve <select id="sleeve"><option value="short">Short</option><option value="long">Long</option></select></label>
+    <label id="row-rise">Waist height <select id="rise_style"><option value="high" selected>High-waisted (+1 1/2 in rise)</option><option value="standard">Standard</option></select></label>
+    <label id="row-length">Length <select id="length"><option value="standard">Standard</option><option value="long" selected>Long line (+4 in)</option></select></label>
   </fieldset>
   <fieldset><legend>2 · Your measurements <span class="note" id="unitnote">(inches)</span></legend>
     <div class="row noprint" style="margin-bottom:6px"><button id="p-demo">Example body A</button><button id="p-corn">Tutorial example (37.5 in chest)</button></div>
     <label>Units <select id="units"><option value="in">inches</option><option value="cm">centimetres</option></select></label>
     <div id="meas"></div>
     <label>Paper <select id="page"><option value="a4">A4</option><option value="letter">US Letter</option></select></label>
+  </fieldset>
+  <fieldset id="fs-gauge" style="display:none"><legend>Knitting gauge (from your swatch)</legend>
+    <label>Stitches per 4 in (10 cm) <input type="number" id="gauge_sts" step="0.5" min="8" value="20"></label>
+    <label>Rows per 4 in (10 cm) <input type="number" id="gauge_rows" step="0.5" min="8" value="28"></label>
+    <div class="note">Knit a swatch, wash and dry it, then count. Type the numbers here (always per 4 in, not per cm).</div>
   </fieldset>
   <fieldset><legend>3 · Fix common fit complaints</legend>
     <div class="note">All zero = the block as designed. Move a slider only if your test garment shows the problem. Change one thing at a time, as in the videos.</div>
@@ -67,12 +73,13 @@
 </aside>
 <section class="v">
   <div id="err"></div>
-  <div class="tabs"><button data-t="sheet" class="on">Pattern</button><button data-t="pages">Print pages</button><button data-t="explain">How it was designed</button></div>
+  <div class="tabs"><button data-t="sheet" class="on">Pattern</button><button data-t="pages">Print pages</button><button data-t="explain">How it was designed</button><button data-t="instr" id="tab-instr" style="display:none">Knitting instructions</button></div>
   <div class="panes">
   <div class="pane on" id="pane-sheet"><div class="row noprint" style="margin-bottom:8px"><button id="dl" class="primary">Download full-size SVG</button><span class="note" id="sheetinfo"></span></div><div id="sheetwrap"></div></div>
   <div class="pane" id="pane-pages"><div class="row noprint" style="margin-bottom:8px"><button class="primary" id="print">Print all pages</button><span class="note" id="pageinfo"></span></div>
     <p class="note noprint">Print at 100% (not “fit to page”), margins none/default, then check the 1 in square on the first page. Trim nothing: neighbouring pages overlap by 1/2 in; line up the red crosses and tape.</p><div id="pages"></div></div>
   <div class="pane" id="pane-explain"><div id="warnings"></div><h3>Self-checks</h3><div id="checks"></div><h3>How the pattern is drawn</h3><ol class="explain" id="explain"></ol></div>
+  <div class="pane" id="pane-instr"><h3>Written instructions</h3><ol class="explain" id="instr"></ol></div>
   </div>
 </section>
 </main>

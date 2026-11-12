@@ -50,7 +50,7 @@ fn serve(port: u16, web_dir: &str) {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a.get(1).map(|s| s.as_str()) {
-        Some("tee") => {
+        Some("tee") | Some("make") => {
             let r = (|| -> Result<(), String> {
                 let p = apply_args(&a[2..])?;
                 let out = a.iter().find_map(|x| x.strip_prefix("--out=")).unwrap_or("out").to_string();
@@ -69,6 +69,6 @@ fn main() {
             let port = a.iter().find_map(|x| x.strip_prefix("--port=")).and_then(|v| v.parse().ok()).unwrap_or(8080);
             serve(port, a.iter().find_map(|x| x.strip_prefix("--web=")).unwrap_or("web"));
         }
-        _ => eprintln!("usage:\n  patternkit tee [--fit=baggy|regular|fitted] [--chest=35.25 ...] [--params=file.json] --out=dir\n  patternkit serve [--port=8080] [--web=web]"),
+        _ => eprintln!("usage:\n  patternkit make [--garment=tshirt|shirt|hoodie|trousers|knit] [--fit=baggy|regular|fitted] [--chest=35.25 ...] [--params=file.json] --out=dir\n  patternkit serve [--port=8080] [--web=web]"),
     }
 }

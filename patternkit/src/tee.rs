@@ -23,7 +23,15 @@ pub struct Piece {
     pub marks: Vec<Mark>,      // construction layer
 }
 
-pub struct Draft { pub pieces: Vec<Piece>, pub explain: Vec<String>, pub checks: Vec<Check>, pub warnings: Vec<String> }
+pub struct Draft {
+    pub title: String,            // sheet heading
+    pub info: Vec<String>,        // up to three small lines under the heading
+    pub pieces: Vec<Piece>,
+    pub explain: Vec<String>,
+    pub instructions: Vec<String>, // written steps (knitting)
+    pub checks: Vec<Check>,
+    pub warnings: Vec<String>,
+}
 
 pub struct Geo {
     pub sa: f64, pub hem: f64,
@@ -62,6 +70,9 @@ fn body(g: &Geo, p: &Params, _fit: &Fit, front: bool, cm: bool) -> Body {
     outline.extend(armhole.iter().cloned().skip(1)); // armhole down to the underarm
     outline.extend(side.iter().cloned().skip(1));   // side seam to the hem corner
     outline.push((0.0, hem_cl));                  // hem back to the fold
+    let shirt_front = front && p.garment == "shirt";
+    let band_w = 2.5;
+    if shirt_front { outline.pop(); outline.push((-band_w, hem_cl)); outline.insert(0, (-band_w, depth)); }
     let fold = ((0.0, hem_cl), (0.0, depth));
     let (sa, hem) = (g.sa, g.hem);
     let bal = p.balance.abs() + 1e-6;
@@ -97,10 +108,14 @@ fn body(g: &Geo, p: &Params, _fit: &Fit, front: bool, cm: bool) -> Body {
     marks.push(Mark::Dim { a: (0.0, 0.0), b: (g.x5, 0.0), off: -1.7, text: format!("1/4 chest + ease + SA {}", fmt(g.x5, cm)) });
     if front { marks.push(Mark::Dim { a: (0.0, 0.0), b: (0.0, g.fd), off: ox + 0.6, text: format!("front neck {}", fmt(g.fd, cm)) }); }
 
+    if shirt_front {
+        marks.push(Mark::Line { a: (-band_w / 2.0, depth - 0.3), b: (-band_w / 2.0, g.y4 + 0.2), label: "fold of button band".into() });
+        marks.push(Mark::Dim { a: (-band_w, g.y4 + 0.3), b: (0.0, g.y4 + 0.3), off: 0.5, text: format!("band {} = 2 x 1 1/4 in", fmt(band_w, cm)) });
+    }
     let side_len = length(&side);
     let shoulder_len = dist(n10, p17);
     let name = if front { "FRONT" } else { "BACK" };
-    let piece = Piece { name: name.into(), cut: "Cut 1 on the fold".into(), outline, sew, fold: Some(fold),
+    let piece = Piece { name: name.into(), cut: if shirt_front { "Cut 2 (mirror: one left, one right)".into() } else { "Cut 1 on the fold".into() }, outline, sew, fold: if shirt_front { None } else { Some(fold) },
         grain: ((g.x5 * 0.5, g.y2 + 1.0), (g.x5 * 0.5, g.y3 + 5.0)), notches: vec![((g.x5, g.y3), (g.x5 - 0.3, g.y3))], marks };
     Body { piece, armhole, side_len, shoulder_len, neck_curve, p17, p5 }
 }
@@ -128,7 +143,7 @@ fn cap_half(apex_to: P, target: f64, warn: &mut Vec<String>, name: &str) -> Vec<
 }
 
 pub fn draft(p: &Params) -> Result<Draft, String> {
-    if p.garment != "tshirt" { return Err(format!("garment '{}' is not available yet (tshirt only)", p.garment)); }
+    if !["tshirt", "shirt", "hoodie"].contains(&p.garment.as_str()) { return Err(format!("garment '{}' is not a top (use tshirt, shirt or hoodie)", p.garment)); }
     let fit = fit_table(&p.fit)?;
     let cm = p.units == "cm";
     for (v, n) in [(p.chest, "chest"), (p.neck, "neck"), (p.shoulder, "shoulder"), (p.bicep, "bicep"), (p.wrist, "wrist"), (p.cb_to_waist, "cb_to_waist")] {
@@ -141,8 +156,10 @@ pub fn draft(p: &Params) -> Result<Draft, String> {
     let y1 = 1.25;
     let len = p.cb_to_waist + fit.hem_below_waist + if p.length == "long" { 4.0 } else { 0.0 } + p.length_adj;
     // a tee has no collar stand, so its neck hole is opened up from the shirt block's neck/5 and neck/4 (+1/2 in wide, +3/4 in deep)
-    let wn = (p.neck + p.neck_adj) / 5.0 + 0.5;
-    let fd = (p.neck + p.neck_adj) / 4.0 + 0.75;
+    let kind = p.garment.as_str();
+    let nk = p.neck + p.neck_adj;
+    // a shirt neck is sized for its collar stand; a hoodie neck is higher than a tee's because the hood sits in it
+    let (wn, fd) = match kind { "shirt" => (nk / 5.0, nk / 5.0 + 0.5), "hoodie" => (nk / 5.0 + 0.25, nk / 5.0 + 1.25), _ => (nk / 5.0 + 0.5, nk / 4.0 + 0.75) };
     let x17 = p.shoulder / 2.0 + fit.shoulder_extend + sa;
     let x12 = x17 - 0.5;
     let mut x5 = p.chest / 4.0 + ease / 4.0 + sa;
@@ -176,8 +193,9 @@ pub fn draft(p: &Params) -> Result<Draft, String> {
     let capb = cap_half((w3b, cap_h), tb2, &mut warnings, "Back");
     let slack = fit.bicep_slack; let wslack = fit.wrist_slack;
     let xb = (p.bicep + slack) / 2.0 + sa;
-    let long = p.sleeve == "long";
-    let slen = (if long { p.sleeve_to_wrist } else { p.short_sleeve }) - fit.shoulder_extend * 0.5 + p.sleeve_length_adj;
+    let long = p.sleeve == "long" || kind == "hoodie";
+    let cuff_h = match kind { "shirt" => 2.5, "hoodie" => 3.0, _ => 0.0 }; // finished cuff height, taken off a long sleeve
+    let slen = (if long { p.sleeve_to_wrist - cuff_h } else { p.short_sleeve }) - fit.shoulder_extend * 0.5 + p.sleeve_length_adj;
     let xw = (p.wrist + wslack) / 2.0 + sa;
     let half = |cap: &Vec<P>, s: f64, w3: f64| -> Vec<P> {
         let mut v: Vec<P> = cap.iter().map(|q| (s * q.0, q.1)).collect();
@@ -217,16 +235,69 @@ pub fn draft(p: &Params) -> Result<Draft, String> {
     let sleeve = Piece { name: "SLEEVE".into(), cut: "Cut 2 (one left, one right; flip the paper)".into(), outline: sleeve_outline, sew: sleeve_sew, fold: None,
         grain: ((0.0, cap_h + 1.0), (0.0, cap_h + 7.0)), notches: vec![((0.0, 0.0), (0.0, 0.35)), ((w3f, cap_h), (w3f - 0.3, cap_h + 0.0))], marks: sm };
 
-    // ---- neck rib / collar band ----
+    // ---- neck finish and the extra pieces for this garment ----
     let neck_open = 2.0 * (length(&f.neck_curve) + length(&b.neck_curve));
-    let band_len = 0.85 * neck_open;
-    let band_w = 1.0;
-    let cw = band_len + 2.0 * sa; let ch = 2.0 * band_w + 2.0 * sa;
-    let collar = Piece { name: "NECK BAND".into(), cut: "Cut 1 in rib / stretch knit, long way along the stretch".into(), outline: vec![(0.0, 0.0), (cw, 0.0), (cw, ch), (0.0, ch)],
-        sew: if p.show_sew_line { vec![(sa, sa), (cw - sa, sa), (cw - sa, ch - sa), (sa, ch - sa)] } else { vec![] }, fold: None,
-        grain: ((cw * 0.3, ch * 0.5), (cw * 0.7, ch * 0.5)), notches: vec![((cw * 0.5, 0.0), (cw * 0.5, 0.3))],
-        marks: vec![Mark::Line { a: (-0.2, ch / 2.0), b: (cw + 0.2, ch / 2.0), label: "fold line".into() },
-            Mark::Dim { a: (0.0, ch + 0.4), b: (cw, ch + 0.4), off: 0.0, text: format!("{} = 85% of neck opening {} + 2 SA", fmt(cw, cm), fmt(neck_open, cm)) }] };
+    let rect = |name: &str, cut: &str, w: f64, h: f64, note: String, grain_along: bool| -> Piece {
+        let (cw, ch) = (w + 2.0 * sa, h + 2.0 * sa);
+        Piece { name: name.into(), cut: cut.into(), outline: vec![(0.0, 0.0), (cw, 0.0), (cw, ch), (0.0, ch)],
+            sew: if p.show_sew_line { vec![(sa, sa), (cw - sa, sa), (cw - sa, ch - sa), (sa, ch - sa)] } else { vec![] }, fold: None,
+            grain: if grain_along { ((cw * 0.3, ch * 0.5), (cw * 0.7, ch * 0.5)) } else { ((cw * 0.5, ch * 0.25), (cw * 0.5, ch * 0.75)) },
+            notches: vec![((cw * 0.5, 0.0), (cw * 0.5, 0.3))],
+            marks: vec![Mark::Line { a: (-0.2, ch / 2.0), b: (cw + 0.2, ch / 2.0), label: "fold line".into() },
+                Mark::Dim { a: (0.0, ch + 0.4), b: (cw, ch + 0.4), off: 0.0, text: note }] }
+    };
+    let mut extra: Vec<Piece> = vec![];
+    let mut extra_checks: Vec<(String, String, bool)> = vec![];
+    let mut extra_explain: Vec<String> = vec![];
+    match kind {
+        "shirt" => {
+            let ls = neck_open + 0.75;
+            extra.push(rect("COLLAR STAND", "Cut 2 (outer + inner), interface one", ls, 2.5, format!("{} = neck opening {} + 3/4 in button overlap + 2 SA; {} = 2 x 1 1/4 in + 2 SA", fmt(ls + 2.0 * sa, cm), fmt(neck_open, cm), fmt(2.5 + 2.0 * sa, cm)), true));
+            let (hc, lc) = (2.25 + sa, ls + 2.0 * sa);
+            let outline = vec![(0.0, 0.0), (lc, 0.0), (lc + 0.6, hc + sa), (-0.6, hc + sa)];
+            extra.push(Piece { name: "COLLAR".into(), cut: "Cut 2 (outer + under), interface one".into(), sew: if p.show_sew_line { offset_inward(&outline, &|_, _| sa) } else { vec![] }, outline, fold: None,
+                grain: ((lc * 0.3, hc * 0.5), (lc * 0.7, hc * 0.5)), notches: vec![((lc * 0.5, 0.0), (lc * 0.5, 0.3))],
+                marks: vec![Mark::Dim { a: (0.0, hc + sa + 0.4), b: (lc, hc + sa + 0.4), off: 0.0, text: format!("lower edge {} = stand length; the top edge is 1 1/4 in longer so the collar rolls over the stand", fmt(lc, cm)) }] });
+            if long {
+                let cl = p.wrist + 2.5 + 1.0;
+                extra.push(rect("CUFF", "Cut 4 (2 pairs), interface 2", cl, 2.0 * cuff_h, format!("{} = wrist {} + 2 1/2 in room + 1 in button overlap + 2 SA", fmt(cl + 2.0 * sa, cm), fmt(p.wrist, cm)), true));
+                extra_checks.push(("Cuff clears the hand (wrist + 2 in or more)".into(), format!("{} around (wrist {})", fmt(p.wrist + 2.5, cm), fmt(p.wrist, cm)), true));
+            }
+            extra_checks.push(("Collar stand matches the neck (neck - 1/2 in to neck + 2 1/2 in)".into(), format!("opening {} (neck {})", fmt(neck_open, cm), fmt(nk, cm)), neck_open >= nk - 0.5 && neck_open <= nk + 2.5));
+            extra_explain.push(format!("Shirt neck: width neck/5 = {} and front depth neck/5 + 1/2 = {} (a shirt neck is cut small because the collar stand sits on it). The front has a cut-on button band, {} wide, folded in half twice; button holes go on the right front for men, left for women.", fmt(wn, cm), fmt(fd, cm), fmt(2.5, cm)));
+            extra_explain.push(format!("Collar stand = neck opening {} + 3/4 in overlap, 1 1/4 in tall when finished; the collar sews to it and its top edge is 1 1/4 in longer so it rolls. The long sleeve is shortened by the {} cuff and gathered into it.", fmt(neck_open, cm), fmt(cuff_h, cm)));
+        }
+        "hoodie" => {
+            let l = length(&f.neck_curve) + length(&b.neck_curve);
+            let hh = 0.9 * nk + 1.0; let hw = 0.75 * nk;
+            let mut o = vec![(0.0, hh), (l, hh)];
+            o.extend(spline(&[(l, hh), (hw * 0.97, hh * 0.55), (hw, hh * 0.22)]).into_iter().skip(1));
+            o.extend(spline(&[(hw, hh * 0.22), (hw * 0.9, hh * 0.04), (hw * 0.55, 0.0), (hw * 0.2, hh * 0.06), (0.0, hh * 0.3)]).into_iter().skip(1));
+            extra.push(Piece { name: "HOOD".into(), cut: "Cut 2 (mirror), + 2 lining if double".into(), sew: if p.show_sew_line { offset_inward(&o, &|_, _| sa) } else { vec![] }, outline: o, fold: None,
+                grain: ((hw * 0.35, hh * 0.45), (hw * 0.35, hh * 0.85)), notches: vec![((l * 0.5, hh), (l * 0.5, hh - 0.3))],
+                marks: vec![Mark::Dim { a: (0.0, hh), b: (l, hh), off: 0.8, text: format!("neck edge {} = front + back neck curve (sews to one half of the neck)", fmt(l, cm)) },
+                    Mark::Dim { a: (0.0, 0.0), b: (0.0, hh), off: -0.8, text: format!("height {} = 0.9 x neck + 1 in", fmt(hh, cm)) },
+                    Mark::Dim { a: (0.0, hh * 0.1), b: (hw, hh * 0.1), off: 0.0, text: format!("width {} = 0.75 x neck", fmt(hw, cm)) }] });
+            let open = 2.0 * (xw - sa);
+            extra.push(rect("RIB CUFF", "Cut 2 in rib, stretch along the length", 0.75 * open, 2.0 * cuff_h, format!("{} = 0.75 x sleeve opening {} + 2 SA (rib stretches to fit)", fmt(0.75 * open + 2.0 * sa, cm), fmt(open, cm)), true));
+            let hemc = 4.0 * (x5 - sa);
+            extra.push(rect("RIB WAISTBAND", "Cut 1 in rib, goes all the way round", 0.75 * hemc, 2.0 * 3.0, format!("{} = 0.75 x finished hem {} + 2 SA", fmt(0.75 * hemc + 2.0 * sa, cm), fmt(hemc, cm)), true));
+            let (pb, pt, ph) = (0.36 * (p.chest + ease), 0.26 * (p.chest + ease), 8.5);
+            let po = vec![((pb - pt) / 2.0, 0.0), ((pb + pt) / 2.0, 0.0), (pb, ph), (0.0, ph)];
+            extra.push(Piece { name: "POCKET".into(), cut: "Cut 1 (kangaroo pocket; hem the angled openings 1 in)".into(), sew: if p.show_sew_line { offset_inward(&po, &|_, _| sa) } else { vec![] }, outline: po, fold: None,
+                grain: ((pb * 0.5, ph * 0.2), (pb * 0.5, ph * 0.8)), notches: vec![],
+                marks: vec![Mark::Dim { a: (0.0, ph), b: (pb, ph), off: 0.6, text: format!("bottom {} = 0.36 x finished chest; top {} = 0.26 x", fmt(pb, cm), fmt(pt, cm)) }] });
+            extra_checks.push(("Hood edge sews to the neck".into(), format!("{} per half; opening {} (neck {})", fmt(l, cm), fmt(neck_open, cm), fmt(nk, cm)), neck_open >= nk + 1.5));
+            extra_checks.push(("Hood tall enough for a head (height >= 0.75 x neck + 2 in)".into(), fmt(hh, cm), hh >= 0.75 * nk + 2.0 - 1e-9));
+            extra_explain.push(format!("Hoodie neck: width neck/5 + 1/4 = {}, front depth neck/5 + 1 1/4 = {} (a hoodie neck is shallower than a tee's because the hood sits in it). The hood is two mirrored halves {} tall and {} wide, sewn together along the curved top and back edge; its straight lower edge ({}) sews to half of the neck opening, and the face edge is hemmed.", fmt(wn, cm), fmt(fd, cm), fmt(hh, cm), fmt(hw, cm), fmt(l, cm)));
+            extra_explain.push(format!("Rib cuffs and waistband are cut at 0.75 x the opening they sew to, so the rib pulls the body in at the hem and wrist (as the loose bodies of a baggy hoodie do). The sleeve is shortened by the {} cuff.", fmt(cuff_h, cm)));
+        }
+        _ => {
+            let band_len = 0.85 * neck_open;
+            extra.push(rect("NECK BAND", "Cut 1 in rib / stretch knit, long way along the stretch", band_len, 2.0, format!("{} = 85% of neck opening {} + 2 SA", fmt(band_len + 2.0 * sa, cm), fmt(neck_open, cm)), true));
+            extra_checks.push(("Neck opening clears the neck (>= neck + 4 in)".into(), format!("{} (neck {})", fmt(neck_open, cm), fmt(p.neck, cm)), neck_open >= p.neck + p.neck_adj + 4.0));
+        }
+    }
 
     // ---- checks ----
     let mut checks = vec![];
@@ -237,14 +308,14 @@ pub fn draft(p: &Params) -> Result<Draft, String> {
     let (cf, cb) = (length(&capf), length(&capb));
     chk("Sleeve cap vs front armhole (half)", format!("cap {} vs armhole {} ({} to ease in)", fmt(cf, cm), fmt(alf, cm), fmt((cf - alf).max(0.0), cm)), (cf - tf).abs() < 0.3 + allowed_ease && cf - alf > -0.1);
     chk("Sleeve cap vs back armhole (half)", format!("cap {} vs armhole {} ({} to ease in)", fmt(cb, cm), fmt(alb, cm), fmt((cb - alb).max(0.0), cm)), cb - alb <= allowed_ease + 0.3 && cb - alb > -0.1);
-    chk("Neck opening clears the neck (>= neck + 4 in)", format!("{} (neck {})", fmt(neck_open, cm), fmt(p.neck, cm)), neck_open >= p.neck + p.neck_adj + 4.0);
+    for (l, v, ok) in &extra_checks { chk(l, v.clone(), *ok); }
     chk("Finished chest", format!("{} (body {} + ease {})", fmt(4.0 * (x5 - sa), cm), fmt(p.chest, cm), fmt(4.0 * (x5 - sa) - p.chest, cm)), true);
     chk("Finished sleeve opening at bicep line", fmt(2.0 * (xb - sa) * 1.0, cm), true);
     chk("Garment length, shoulder (neck point) to hem", fmt(g.y4 - hem, cm), true);
 
     // ---- plain-language explanation ----
     let q = p.chest / 4.0;
-    let explain = vec![
+    let mut explain = vec![
         format!("Block: the numbered-points method. Everything is drawn as half a piece against the fold (the centre line) with {} seam allowance in the cut line; the hem allowance is {}.", fmt(sa, cm), fmt(hem, cm)),
         format!("Fit '{}': finished chest = body chest {} + ease {} (preset {} + your adjustment {}) = {}.", p.fit, fmt(p.chest, cm), fmt(ease, cm), fmt(fit.chest_ease, cm), fmt(p.chest_ease_adj, cm), fmt(p.chest + ease, cm)),
         format!("Point 5 (side seam) = 1/4 chest {} + 1/4 ease {} + SA {} = {}.", fmt(q, cm), fmt(ease / 4.0, cm), fmt(sa, cm), fmt(x5, cm)),
@@ -255,7 +326,18 @@ pub fn draft(p: &Params) -> Result<Draft, String> {
         "Point 12 sits halfway down the armhole: the front is pulled in 1/4 in and the back pushed out 1/4 in, because shoulders roll forward and the back needs more room.".to_string(),
         format!("Sleeve: cap height = armhole depth / {:.1} = {}; the cap curve starts as the straight line 0-3 and is bent (up above point 4, slightly down below it) until its length equals the armhole it sews into. Bigger divisor = flatter cap = roomier sleeve.", fit.cap_divisor - p.sleeve_cap_adj, fmt(cap_h, cm)),
         format!("Sleeve width at the bicep line = (bicep {} + slack {})/2 + SA on each side; the sleeve tapers from the cap corners down to it.", fmt(p.bicep, cm), fmt(slack, cm)),
-        format!("Neck band = 85% of the neck opening ({}), folded in half, cut {} wide.", fmt(neck_open, cm), fmt(ch, cm)),
+        format!("Neck band = 85% of the neck opening ({}), folded in half.", fmt(neck_open, cm)),
     ];
-    Ok(Draft { pieces: vec![f.piece, b.piece, sleeve, collar], explain, checks, warnings })
+    if kind != "tshirt" { explain.truncate(9); explain[5] = format!("Points 10-18 as in the tee; the neck is sized for the {} (see below).", kind); }
+    explain.extend(extra_explain);
+    let kname = match kind { "shirt" => "shirt", "hoodie" => "hoodie", _ => "t-shirt" };
+    let title = if kind == "hoodie" { format!("{} hoodie", p.fit) } else { format!("{} {}, {} sleeve", p.fit, kname, if long { "long" } else { "short" }) };
+    let info = vec![
+        format!("chest {}  neck {}  shoulder {}  bicep {}", fmt(p.chest, cm), fmt(p.neck, cm), fmt(p.shoulder, cm), fmt(p.bicep, cm)),
+        format!("wrist {}  CB neck to waist {}", fmt(p.wrist, cm), fmt(p.cb_to_waist, cm)),
+        "Print at 100%. Seam allowance 1/2 in included.".to_string(),
+    ];
+    let mut pieces = vec![f.piece, b.piece, sleeve];
+    pieces.extend(extra);
+    Ok(Draft { title, info, pieces, explain, instructions: vec![], checks, warnings })
 }
