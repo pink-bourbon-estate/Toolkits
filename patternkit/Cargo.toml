@@ -1,0 +1,16 @@
+[package]
+name = "patternkit"
+version = "0.1.0"
+edition = "2021"
+description = "Parametric clothing pattern drafting: measurements + fit + common-complaint adjustments in, printable tiled pattern out."
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true

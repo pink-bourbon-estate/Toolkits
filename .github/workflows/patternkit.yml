@@ -1,0 +1,41 @@
+name: patternkit
+on:
+  push:
+    branches: [main]
+    paths: ['patternkit/**', '.github/workflows/patternkit.yml', '.gitleaks.toml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (keys, tokens, passwords, personal emails)
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+  build:
+    needs: secrets
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: patternkit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo test --release
+      - run: cargo build --release --lib --target wasm32-unknown-unknown
+      - run: cp target/wasm32-unknown-unknown/release/patternkit.wasm web/patternkit.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patternkit-web
+          path: patternkit/web

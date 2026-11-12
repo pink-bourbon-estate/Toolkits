@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pattern toolkit — parametric clothing patterns</title>
+<style>
+  :root { --ink:#1b1b1b; --mute:#666; --line:#ddd; --accent:#1a6fb5; --bad:#b3261e; --good:#1a7f37; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, sans-serif; color:var(--ink); background:#f6f6f4; }
+  header { padding:14px 20px; background:#fff; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; } header span { color:var(--mute); font-size:13px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:0; min-height: calc(100vh - 52px); }
+  aside { background:#fff; border-right:1px solid var(--line); padding:14px 16px 40px; overflow-y:auto; max-height: calc(100vh - 52px); position:sticky; top:0; }
+  section.v { padding:14px 18px 60px; min-width:0; }
+  fieldset { border:1px solid var(--line); border-radius:8px; margin:0 0 14px; padding:8px 12px 12px; }
+  legend { font-weight:600; font-size:13px; padding:0 6px; }
+  label { display:grid; grid-template-columns: 1fr 96px; gap:8px; align-items:center; margin:5px 0; font-size:13.5px; }
+  label.wide { grid-template-columns: 1fr; } label small { color:var(--mute); display:block; font-size:12px; }
+  input[type=number], select { width:100%; padding:4px 6px; font:inherit; border:1px solid #bbb; border-radius:5px; background:#fff; }
+  input[type=range] { width:100%; } .sl { margin:9px 0 3px; } .sl b { font-weight:500; } .sl .val { float:right; color:var(--accent); font-variant-numeric: tabular-nums; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; } button { font:inherit; padding:6px 10px; border:1px solid #aaa; background:#fafafa; border-radius:6px; cursor:pointer; } button:hover { background:#eee; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:12px; } .tabs button { border:none; border-bottom:3px solid transparent; border-radius:0; background:none; padding:8px 12px; }
+  .tabs button.on { border-color:var(--accent); font-weight:600; }
+  .pane { display:none; } .pane.on { display:block; }
+  #sheetwrap { overflow:auto; background:#fff; border:1px solid var(--line); border-radius:6px; padding:6px; max-height:80vh; }
+  .check { display:flex; gap:8px; padding:4px 0; border-bottom:1px solid #eee; font-size:13.5px; } .check i { font-style:normal; width:18px; } .ok i { color:var(--good); } .bad i { color:var(--bad); }
+  .warn { background:#fff4e5; border:1px solid #f0c27b; border-radius:6px; padding:8px 10px; margin:8px 0; font-size:13.5px; }
+  ol.explain li { margin:6px 0; } .note { color:var(--mute); font-size:13px; }
+  #pages { display:flex; flex-wrap:wrap; gap:14px; } .pg { background:#fff; border:1px solid #ccc; box-shadow:0 1px 3px rgba(0,0,0,.1); } .pg svg { display:block; width:100%; height:auto; } .pgbox { width:240px; font-size:12px; } .pgbox.printing { width:auto; }
+  #err { color:var(--bad); font-weight:600; }
+  @media print {
+    body { background:#fff; } header, aside, .tabs, #sheetwrap, .pane:not(#pane-pages), .noprint, section.v > :not(.panes) { display:none !important; }
+    main { display:block; } section.v { padding:0; } #pane-pages { display:block !important; } #pages { display:block; }
+    .pgbox { width:auto !important; page-break-after:always; break-after:page; } .pgbox .cap { display:none; } .pgbox:last-child { break-after:auto; page-break-after:auto; } .pg { border:none; box-shadow:none; }
+    .pg svg { width:var(--pw); height:var(--ph); }
+  }
+</style>
+</head>
+<body>
+<header><h1>Pattern toolkit</h1><span>pick a garment, a fit and your measurements; get a print-ready pattern with the construction shown</span></header>
+<main>
+<aside>
+  <fieldset><legend>1 · Garment and fit</legend>
+    <label>Garment <select id="garment"><option value="tshirt">T-shirt</option><option disabled>Shirt (soon)</option><option disabled>Trousers (soon)</option><option disabled>Joggers (soon)</option><option disabled>Hoodie (soon)</option></select></label>
+    <label>Fit <select id="fit"><option value="fitted">Fitted (tailored block)</option><option value="regular">Regular</option><option value="baggy" selected>Baggy</option></select></label>
+    <label>Sleeve <select id="sleeve"><option value="short">Short</option><option value="long">Long</option></select></label>
+    <label>Length <select id="length"><option value="standard">Standard</option><option value="long" selected>Long line (+4 in)</option></select></label>
+  </fieldset>
+  <fieldset><legend>2 · Your measurements <span class="note" id="unitnote">(inches)</span></legend>
+    <div class="row noprint" style="margin-bottom:6px"><button id="p-demo">Example body A</button><button id="p-corn">Tutorial example (37.5 in chest)</button></div>
+    <label>Units <select id="units"><option value="in">inches</option><option value="cm">centimetres</option></select></label>
+    <div id="meas"></div>
+    <label>Paper <select id="page"><option value="a4">A4</option><option value="letter">US Letter</option></select></label>
+  </fieldset>
+  <fieldset><legend>3 · Fix common fit complaints</legend>
+    <div class="note">All zero = the block as designed. Move a slider only if your test garment shows the problem. Change one thing at a time, as in the videos.</div>
+    <div id="alts"></div>
+    <div class="row noprint" style="margin-top:8px"><button id="reset-alts">Reset adjustments</button></div>
+  </fieldset>
+  <fieldset><legend>4 · Show on the pattern</legend>
+    <label>Construction lines &amp; numbered points <input type="checkbox" id="show_construction" checked></label>
+    <label>Rulers <input type="checkbox" id="show_ruler" checked></label>
+    <label>Sew line (inside the seam allowance) <input type="checkbox" id="show_sew_line" checked></label>
+  </fieldset>
+</aside>
+<section class="v">
+  <div id="err"></div>
+  <div class="tabs"><button data-t="sheet" class="on">Pattern</button><button data-t="pages">Print pages</button><button data-t="explain">How it was designed</button></div>
+  <div class="panes">
+  <div class="pane on" id="pane-sheet"><div class="row noprint" style="margin-bottom:8px"><button id="dl" class="primary">Download full-size SVG</button><span class="note" id="sheetinfo"></span></div><div id="sheetwrap"></div></div>
+  <div class="pane" id="pane-pages"><div class="row noprint" style="margin-bottom:8px"><button class="primary" id="print">Print all pages</button><span class="note" id="pageinfo"></span></div>
+    <p class="note noprint">Print at 100% (not “fit to page”), margins none/default, then check the 1 in square on the first page. Trim nothing: neighbouring pages overlap by 1/2 in; line up the red crosses and tape.</p><div id="pages"></div></div>
+  <div class="pane" id="pane-explain"><div id="warnings"></div><h3>Self-checks</h3><div id="checks"></div><h3>How the pattern is drawn</h3><ol class="explain" id="explain"></ol></div>
+  </div>
+</section>
+</main>
+<svg width="0" height="0" style="position:absolute"><defs><g id="sheetdef"></g></defs></svg>
+<script src="app.js"></script>
+</body>
+</html>
