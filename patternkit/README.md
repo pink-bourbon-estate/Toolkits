@@ -41,6 +41,6 @@ PatternKit is original code, but the ideas and techniques behind it come from pe
 * **Cornelius Quiring**: the drafting method (numbered points, half pieces on the fold, sleeve cap matched to the armhole) and the "common complaints" alterations come from his pattern-drafting and fitting videos.
 * **Firmé Atelier**: how to take body measurements for bespoke work (natural-waist cord, straight-line shoulder and back widths, snug circumferences), from their measurement video.
 * **Glory Allan**: the loose, true-to-size retail fit that inspired the proportions of the "baggy" setting; her tee's published ease and armhole depth were used as a sanity check, not copied.
-* **Bernadette**: inspiration for approaching garment construction as something you can understand and explain.
+* **Bernadette Banner** ([YouTube](https://www.youtube.com/@bernadettebanner)): general inspiration. Her channel covers costume analysis and fashion history, which encourages treating a garment as something you can take apart and explain.
 
 None of them have endorsed or reviewed this project; any mistakes in how their ideas are applied are mine.
