@@ -33,3 +33,14 @@ For a static site (GitHub Pages) the same engine is compiled to WebAssembly by `
 * The WebAssembly build is written but was not compiled where this was developed (no wasm target available there); CI builds it.
 * Body mapping: "across shoulders" is the bone-to-bone width from a tailor's measurement sheet; the shirt block's own "half back" is derived from it.
 * Seam allowances are fixed at 1/2 in, hems at 1 in.
+
+## Credits and inspiration
+
+PatternKit is original code, but the ideas and techniques behind it come from people who share their craft publicly. Thank you to:
+
+* **Cornelius Quiring**: the drafting method (numbered points, half pieces on the fold, sleeve cap matched to the armhole) and the "common complaints" alterations come from his pattern-drafting and fitting videos.
+* **Firmé Atelier**: how to take body measurements for bespoke work (natural-waist cord, straight-line shoulder and back widths, snug circumferences), from their measurement video.
+* **Glory Allan**: the loose, true-to-size retail fit that inspired the proportions of the "baggy" setting; her tee's published ease and armhole depth were used as a sanity check, not copied.
+* **Bernadette**: inspiration for approaching garment construction as something you can understand and explain.
+
+None of them have endorsed or reviewed this project; any mistakes in how their ideas are applied are mine.
