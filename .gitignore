@@ -30,3 +30,9 @@ __pycache__/
 # BakeCraft app data
 current_plan.json
 settings.json
+
+# UK Tree Map: generated data and downloaded rasters (publish these via Releases, not git)
+uk-tree-map/data/
+uk-tree-map/_cache/
+uk-tree-map/.venv/
+.pytest_cache/
