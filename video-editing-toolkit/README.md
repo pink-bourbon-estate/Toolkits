@@ -11,7 +11,7 @@ It is a thin, careful wrapper around [ffmpeg](https://ffmpeg.org). Written in Ru
 This replaces the three separate Python scripts (`compress_video.py`, `extract_audio.py`, `extract_frames.py`).
 
 ## Install (Windows)
-1. Install ffmpeg once: `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` and `ffprobe.exe` next to this program). Version 5.1 or newer.
+1. Install ffmpeg once: `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` and `ffprobe.exe` next to this program). Any recent version works (older than 5.1 is handled too).
 2. Download `video-editing-toolkit.exe` from the newest **Video Editing Toolkit v0.1.x** release on the [Releases page](https://github.com/pink-bourbon-estate/toolkits/releases).
 3. Run it. If SmartScreen warns about an unknown app, click **More info, Run anyway** (it isn't code-signed).
 4. Click **Install Video Editing Toolkit** on the bottom bar. It copies itself to `%LOCALAPPDATA%\Programs\VideoEditingToolkit` (no admin rights) and adds a Start menu entry and a **Settings, Apps** entry.

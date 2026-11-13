@@ -225,6 +225,31 @@ pub fn time_label(secs: f64, with_ms: bool) -> String {
 pub struct Tools {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    /// ffmpeg 5.1 renamed -vsync to -fps_mode; older builds (Ubuntu 22.04 has 4.4) only know -vsync.
+    pub fps_flag: &'static str,
+}
+
+/// Reads "ffmpeg version 6.1.1-3ubuntu5 ..." as (6, 1). Git builds ("N-12345-g...") count as new.
+pub fn parse_version(text: &str) -> Option<(u32, u32)> {
+    let rest = text.lines().next()?.split("version").nth(1)?.trim();
+    let first = rest.split_whitespace().next()?;
+    if first.starts_with('N') || first.starts_with('n') && first.contains("-g") {
+        return Some((99, 0));
+    }
+    let digits: String = first.trim_start_matches('n').chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let mut it = digits.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+fn fps_flag_for(ffmpeg: &Path) -> &'static str {
+    let out = command(ffmpeg).arg("-version").stdin(Stdio::null()).output().ok();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    match parse_version(&text) {
+        Some((major, minor)) if major < 5 || (major == 5 && minor < 1) => "-vsync",
+        _ => "-fps_mode",
+    }
 }
 
 fn command(p: &Path) -> Command {
@@ -256,7 +281,8 @@ pub fn find_tools() -> Result<Tools, String> {
     for (ff, fp) in candidates {
         if works(&ff) {
             let probe = if works(&fp) { fp } else { PathBuf::from("ffprobe") };
-            return Ok(Tools { ffmpeg: ff, ffprobe: probe });
+            let fps_flag = fps_flag_for(&ff);
+            return Ok(Tools { ffmpeg: ff, ffprobe: probe, fps_flag });
         }
     }
     Err(if cfg!(windows) {
@@ -363,7 +389,7 @@ pub fn audio_args(input: &Path, output: &Path, o: &AudioOpts) -> Vec<String> {
 }
 
 /// `pattern` is the output file pattern, for example `/out/clip_frames/frame_%08d.jpg`.
-pub fn frames_args(input: &Path, pattern: &Path, o: &FramesOpts) -> Vec<String> {
+pub fn frames_args(input: &Path, pattern: &Path, o: &FramesOpts, fps_flag: &str) -> Vec<String> {
     let mut a = common(true);
     if o.start > 0.0 {
         a.extend([s("-ss"), format!("{}", o.start)]);
@@ -377,7 +403,7 @@ pub fn frames_args(input: &Path, pattern: &Path, o: &FramesOpts) -> Vec<String> 
         vf.push_str(",mpdecimate");
     }
     vf.push_str(&format!(",scale='min({},iw)':-2", o.max_width));
-    a.extend([s("-vf"), vf, s("-fps_mode"), s("passthrough"), s("-enc_time_base"), s("1/1000"), s("-frame_pts"), s("1")]);
+    a.extend([s("-vf"), vf, s(fps_flag), s("passthrough"), s("-enc_time_base"), s("1/1000"), s("-frame_pts"), s("1")]);
     if o.format == ImageFormat::Jpg {
         a.extend([s("-q:v"), o.quality.to_string()]);
     }
@@ -579,7 +605,7 @@ fn frames_one(tools: &Tools, o: &FramesOpts, input: &Path, dir: &Path, pr: &Prob
     std::fs::create_dir_all(&fdir).map_err(|e| e.to_string())?;
     let ext = o.format.ext();
     let pattern = fdir.join(format!("vet_%08d.{ext}"));
-    let args = frames_args(input, &pattern, o);
+    let args = frames_args(input, &pattern, o, tools.fps_flag);
     let shown_duration = pr.duration.map(|d| (d - o.start).max(0.1));
     let res = run_ffmpeg(tools, &args, shown_duration, cancel, on_progress);
     let produced = list_temp_frames(&fdir, ext);
@@ -687,12 +713,22 @@ mod tests {
     #[test]
     fn frames_filter() {
         let o = FramesOpts { interval: 0.5, dedupe: true, start: 3.0, ..Default::default() };
-        let j = frames_args(Path::new("a.mp4"), Path::new("x/vet_%08d.jpg"), &o).join(" ");
+        let j = frames_args(Path::new("a.mp4"), Path::new("x/vet_%08d.jpg"), &o, "-fps_mode").join(" ");
         assert!(j.contains("select='gte(t+0.001,selected_n*0.5)',mpdecimate,scale="));
         assert!(j.contains("-ss 3"));
         assert!(j.contains("-frame_pts 1"));
-        let j = frames_args(Path::new("a.mp4"), Path::new("x/vet_%08d.jpg"), &FramesOpts::default()).join(" ");
+        let j = frames_args(Path::new("a.mp4"), Path::new("x/vet_%08d.jpg"), &FramesOpts::default(), "-vsync").join(" ");
+        assert!(j.contains("-vsync passthrough"));
         assert!(j.contains("selected_n*10)',scale="));
+    }
+
+    #[test]
+    fn version_parsing() {
+        assert_eq!(parse_version("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021"), Some((4, 4)));
+        assert_eq!(parse_version("ffmpeg version 6.1.1-3ubuntu5 Copyright"), Some((6, 1)));
+        assert_eq!(parse_version("ffmpeg version 7.1-full_build-www.gyan.dev Copyright"), Some((7, 1)));
+        assert_eq!(parse_version("ffmpeg version N-117000-gabcdef Copyright"), Some((99, 0)));
+        assert_eq!(parse_version("nonsense"), None);
     }
 
     #[test]
