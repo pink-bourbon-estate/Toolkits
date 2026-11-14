@@ -1,0 +1,22 @@
+# --- Personal data: never commit ---
+contacts.csv
+contacts*.csv
+!contacts.example.csv
+.contacts-*.csv
+config.json
+*.zip
+*.vcf
+*.bak
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

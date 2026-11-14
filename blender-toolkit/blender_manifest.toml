@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "blender_toolkit"
+version = "0.7.0"
+name = "Blender Toolkit"
+tagline = "Production toolkit for Blender — transform, align, materials, UV, generators and more"
+maintainer = "Blender Toolkit contributors"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Script can read/write files on the local system"

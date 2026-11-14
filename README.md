@@ -14,6 +14,10 @@ Small desktop tools, mostly built in Rust with egui. Each tool lives in its own 
 | [YouTube Frames](youtube-frames/) | Python script: capture a frame from a YouTube video every mm:ss and save them as compressed 960x540 JPEGs | [`youtube_frames.py`](youtube-frames/youtube_frames.py) |
 | [PlanetEbook Downloader](planetebook-downloader/) | Python script: download a fixed list of 82 classic books from planetebook.com as EPUB files, skipping any you already have | [`planetebook_download.py`](planetebook-downloader/planetebook_download.py) |
 | [Artvee Offline Downloader](artvee-downloader/) | Python script: download public-domain artwork from Artvee for personal offline study, resized, organised by category and artist, and resumable | [`artvee_offline_downloader.py`](artvee-downloader/artvee_offline_downloader.py) |
+| [Contact Reminder](contact-reminder/) | Python/Tkinter: keeps a plain CSV of contacts and reminds you who you have not been in touch with, plus upcoming birthdays. Data stays in your own file | [`contacts_app.py`](contact-reminder/contacts_app.py) |
+| [Tree Finder](tree-finder/) | Python: finds tree crowns, hedges and shrubs on a 1 km OS tile (example: central London) from open LiDAR and satellite imagery, with Blender scripts to place them. Untested on the London default | [`find_trees_v0.12.py`](tree-finder/find_trees_v0.12.py) |
+| [Blender Toolkit](blender-toolkit/) | A Blender add-on: a sidebar panel of small scene tools (transform, align, naming, UVs, lighting, generators, cleanup) whose layout you can rearrange | [`blender-toolkit/`](blender-toolkit/) |
+| [Pico 2 learning](pico-2-learning/) | **Learning project, not a tool.** MicroPython experiments on a Raspberry Pi Pico 2 WH: LED on/off and a button that blinks it | [`pico-2-learning/`](pico-2-learning/) |
 
 ## Privacy and security
 - No accounts, telemetry or tracking. The only network use is the optional update check (anonymous download from github.com), plus links you click yourself.

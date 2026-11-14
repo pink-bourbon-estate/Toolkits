@@ -1,0 +1,6 @@
+name,group,phone,email,address,birthday,contact_every_days,last_contacted,snoozed_until,notes
+Alex Example,Family,+00 0000 000000,alex@example.com,"Example address",1990-05-17,14,2026-01-01,,Fictional sample contact
+Sam Placeholder,Friends,+00 0000 000001,,,03-09,30,,,Birthday year unknown
+Jordan Demo,Coworkers,,jordan@example.org,,,90,2026-10-01,,
+Riley Sample,Extended family,+00 0000 000002,,,10-29,60,2026-10-10,,
+Casey Test,,,,,,,,,No reminder set

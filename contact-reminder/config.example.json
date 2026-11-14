@@ -1,0 +1,5 @@
+{
+  "contacts_file": "contacts.csv",
+  "birthday_warning_days": 7,
+  "recheck_hours": 3
+}
