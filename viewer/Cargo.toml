@@ -1,0 +1,45 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+edition = "2024"
+description = "A fast PureRef-styled image viewer for painters: browse, batch-edit, and study colour, value and mixing."
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "tga", "ico", "pnm", "qoi", "rayon"] }
+rayon = "1"
+rfd = "0.17"
+trash = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+kamadak-exif = "0.6"
+ureq = { version = "3", features = ["platform-verifier"] }
+sha2 = "0.11"
+pulldown-cmark = { version = "0.13", default-features = false }
+symphonia = { version = "0.6", default-features = false, features = ["mp1", "mp2", "mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }
+cpal = "0.18"
+hayro = "0.9"
+calamine = "0.38"
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
+quick-xml = "0.41"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[features]
+# Type-check the Windows registry code on Linux against a stub of winreg.
+mockwin = []
